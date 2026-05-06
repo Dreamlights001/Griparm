@@ -1,0 +1,500 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="Arm_6Dof">
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="-0.00521563022618185 8.29309118491598E-07 0.0354953695658926"
+        rpy="0 0 0" />
+      <mass
+        value="14.3848181688365" />
+      <inertia
+        ixx="0.0639338597888526"
+        ixy="-8.13189875651133E-08"
+        ixz="-0.00372948678752425"
+        iyy="0.0737847024894178"
+        iyz="2.46623267957171E-07"
+        izz="0.113241520618042" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.28 0.52 0.78 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="Jianbu_Link">
+    <inertial>
+      <origin
+        xyz="9.23182774966788E-07 0.0014453315353078 -0.00141989169261772"
+        rpy="0 0 0" />
+      <mass
+        value="4.04937476025529" />
+      <inertia
+        ixx="0.00738330779051646"
+        ixy="5.7922808209959E-09"
+        ixz="-2.61699939519434E-08"
+        iyy="0.00785486863170345"
+        iyz="-0.000368605323849023"
+        izz="0.00973795934474612" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Jianbu_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.72 0.44 0.22 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Jianbu_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="J_jianbu"
+    type="continuous">
+    <origin
+      xyz="0 0 0.11"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="Jianbu_Link" />
+    <axis
+      xyz="0 0 1" />
+  </joint>
+  <link
+    name="Dabi_Link">
+    <inertial>
+      <origin
+        xyz="0.018356014404853 0.184106817532758 0.00441772917544226"
+        rpy="0 0 0" />
+      <mass
+        value="1.6088346011298" />
+      <inertia
+        ixx="0.0100765148348041"
+        ixy="-0.00126648014951026"
+        ixz="8.82235558306736E-05"
+        iyy="0.00139947411810608"
+        iyz="0.000919438530098827"
+        izz="0.0100346514437429" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Dabi_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.62 0.70 0.28 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Dabi_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="J_dabi"
+    type="revolute">
+    <origin
+      xyz="0 0 0.065"
+      rpy="1.5708 0 0" />
+    <parent
+      link="Jianbu_Link" />
+    <child
+      link="Dabi_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-1.7453"
+      upper="1.7453"
+      effort="40"
+      velocity="0" />
+  </joint>
+  <link
+    name="Upper_Link">
+    <inertial>
+      <origin
+        xyz="5.879782272461E-05 0.0877737697130378 1.95018046778998E-17"
+        rpy="0 0 0" />
+      <mass
+        value="0.21562108057225" />
+      <inertia
+        ixx="0.000462308408244091"
+        ixy="-4.89726981066451E-07"
+        ixz="-9.14087899968102E-21"
+        iyy="0.000247247739183487"
+        iyz="5.97947244323856E-20"
+        izz="0.000264364063181461" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Upper_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.34 0.40 0.82 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Upper_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="J_Upper"
+    type="revolute">
+    <origin
+      xyz="0.04461 0.3 0"
+      rpy="0 0 -1.5708" />
+    <parent
+      link="Dabi_Link" />
+    <child
+      link="Upper_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-1.047198"
+      upper="1.5708"
+      effort="25"
+      velocity="0" />
+  </joint>
+  <link
+    name="Lower_Link">
+    <inertial>
+      <origin
+        xyz="-0.00725575286606748 9.83980430468989E-09 0.0674547981254198"
+        rpy="0 0 0" />
+      <mass
+        value="0.349997786945152" />
+      <inertia
+        ixx="0.000190863204797066"
+        ixy="5.63663367687888E-12"
+        ixz="-1.00074762107187E-05"
+        iyy="0.000294328357128498"
+        iyz="5.57344180229976E-12"
+        izz="0.000162416180866698" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Lower_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.25 0.70 0.54 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Lower_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="J_Lower"
+    type="continuous">
+    <origin
+      xyz="0 0.15539 0"
+      rpy="-1.5708 -1.5708 0" />
+    <parent
+      link="Upper_Link" />
+    <child
+      link="Lower_Link" />
+    <axis
+      xyz="0 0 -1" />
+  </joint>
+  <link
+    name="Wrist_Link">
+    <inertial>
+      <origin
+        xyz="-0.00915920500706874 0.0414526556191951 -1.52016542270543E-08"
+        rpy="0 0 0" />
+      <mass
+        value="0.133743218379783" />
+      <inertia
+        ixx="5.15917393265877E-05"
+        ixy="7.21057583181707E-06"
+        ixz="5.49254165793553E-11"
+        iyy="3.75958994198359E-05"
+        iyz="4.12926571580918E-11"
+        izz="5.39197585386925E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Wrist_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.86 0.56 0.30 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Wrist_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="J_wrist"
+    type="revolute">
+    <origin
+      xyz="0 0 0.1"
+      rpy="1.5708 0 1.5708" />
+    <parent
+      link="Lower_Link" />
+    <child
+      link="Wrist_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-1.5708"
+      upper="1.5708"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="Hand_Link">
+    <inertial>
+      <origin
+        xyz="1.76946669830966E-07 -0.00858821496570578 0.0467989545150534"
+        rpy="0 0 0" />
+      <mass
+        value="0.24708380496277" />
+      <inertia
+        ixx="7.59311111531335E-05"
+        ixy="6.4441579688007E-10"
+        ixz="1.24923563916955E-10"
+        iyy="0.000192138552175229"
+        iyz="6.73666531540384E-06"
+        izz="0.000174803079680684" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Hand_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.30 0.34 0.40 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Hand_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="J_hand"
+    type="continuous">
+    <origin
+      xyz="0 0.074 0"
+      rpy="-1.5708 -1.5708 0" />
+    <parent
+      link="Wrist_Link" />
+    <child
+      link="Hand_Link" />
+    <axis
+      xyz="0 0 -1" />
+  </joint>
+  <link
+    name="Claw_Link_left">
+    <inertial>
+      <origin
+        xyz="0.043195 -0.0037299 0.0066554"
+        rpy="0 0 0" />
+      <mass
+        value="0.031566" />
+      <inertia
+        ixx="3.5985E-06"
+        ixy="1.5291E-07"
+        ixz="3.6857E-07"
+        iyy="8.014E-06"
+        iyz="-1.8626E-07"
+        izz="6.3983E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Claw_Link_left.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.32 0.46 0.80 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Claw_Link_left.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="Claw_left"
+    type="prismatic">
+    <origin
+      xyz="0 0 0.07"
+      rpy="0 0 0" />
+    <parent
+      link="Hand_Link" />
+    <child
+      link="Claw_Link_left" />
+    <axis
+      xyz="-1 0 0" />
+    <limit
+      lower="0"
+      upper="0.04"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="Claw_Link_right">
+    <inertial>
+      <origin
+        xyz="0.043195 -0.0037299 0.0066554"
+        rpy="0 0 0" />
+      <mass
+        value="0.031566" />
+      <inertia
+        ixx="3.5985E-06"
+        ixy="1.5291E-07"
+        ixz="3.6857E-07"
+        iyy="8.014E-06"
+        iyz="-1.8626E-07"
+        izz="6.3983E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Claw_Link_right.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.32 0.46 0.80 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://Arm_6Dof/meshes/Claw_Link_right.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="claw_right"
+    type="prismatic">
+    <origin
+      xyz="0 0 0.07"
+      rpy="0 0 3.1416" />
+    <parent
+      link="Hand_Link" />
+    <child
+      link="Claw_Link_right" />
+    <axis
+      xyz="1 0 0" />
+    <limit
+      lower="-0.04"
+      upper="0"
+      effort="0"
+      velocity="0" />
+    <mimic
+      joint="Claw_left"
+      multiplier="-1"
+      offset="0" />
+  </joint>
+</robot>
