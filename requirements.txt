@@ -1,0 +1,51 @@
+# ============================================================
+# Griparm2 Sim2Sim 数据采集项目依赖
+# Python 3.10 (sim_env conda 环境)
+# ============================================================
+#
+# 安装: pip install -r requirements.txt
+#
+# 注意: ledataset 是自定义本地包，需手动复制到 site-packages
+#       (已位于 sim_env 环境中，不需要从 pip 安装)
+# ============================================================
+
+# --- MuJoCo 物理引擎 (绑定 GLFW + EGL) ---
+mujoco>=3.2.0
+glfw>=2.10
+PyOpenGL>=3.1.0
+
+# --- 数值计算 ---
+numpy>=2.0.0
+
+# --- 图像 / 视频 ---
+av>=12.0                           # PyAV: 视频编码 (h264)
+opencv-python-headless>=4.10.0     # cv2: 预览窗口
+imageio-ffmpeg>=0.5.0              # 视频格式支持
+pillow>=10.0                       # 图像处理 (lerobot 依赖)
+
+# --- 数据处理 ---
+pandas>=2.0.0
+pyarrow>=15.0                      # Parquet 格式支持
+
+# --- 预览后端 (二选一，至少装一个) ---
+matplotlib>=3.8.0                  # matplotlib 预览后端 (推荐用于 WSL)
+
+# --- LeRobot 数据集格式 ---
+lerobot>=0.1.0
+lerobot-dataset>=0.4.0
+
+# --- PyTorch (lerobot 底层依赖) ---
+torch>=2.0.0
+
+# --- 通用依赖 ---
+PyYAML>=6.0
+huggingface-hub>=0.20.0
+datasets>=3.0.0
+tqdm>=4.60
+packaging>=20.0
+
+# --- 自定义本地包 ---
+# ledataset  = 自定义 LeRobot 数据集封装 (命名空间包)
+#   路径: <site-packages>/ledataset/
+#   需从本地源码复制到 Python 环境的 site-packages 目录
+#   当前 sim_env 已安装，无需额外操作
