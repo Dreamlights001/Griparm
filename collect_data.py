@@ -77,6 +77,7 @@ RESPAWN_MARGIN = 0.06
 DEFAULT_LAYOUT_XML = Path("env_layout_tuned.xml")
 DEFAULT_CAMERA_XML = Path("env_camera_tuned.xml")
 HIDDEN_OBJECT_QPOS = np.array([-2.0, -2.0, -1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+CONVEYOR_DRIVE_Z_MAX = OBJECT_CENTER_Z_ON_BELT + 0.04
 TELEOP_ARM_STEP = 0.015
 TELEOP_GRIPPER_STEP = 0.0015
 TELEOP_JOINT_SPEED = {
@@ -1044,6 +1045,11 @@ def move_conveyor_objects(
         rel = pos - ctx.conveyor_start
         s = float(np.dot(rel, ctx.conveyor_dir))
         lat = float(np.dot(rel, ctx.conveyor_lateral))
+        on_conveyor_xy = -RESPAWN_MARGIN <= s <= CONVEYOR_LENGTH + RESPAWN_MARGIN and abs(lat) <= CONVEYOR_HALF_WIDTH
+        on_conveyor_z = TABLE_Z <= pos[2] <= CONVEYOR_DRIVE_Z_MAX
+
+        if not (on_conveyor_xy and on_conveyor_z):
+            continue
 
         s_new = s - conveyor_speed * dt
         target_pos = ctx.conveyor_start + ctx.conveyor_dir * s_new + ctx.conveyor_lateral * lat
@@ -1123,6 +1129,15 @@ def check_success(data: mujoco.MjData, ctx: SimContext) -> bool:
     in_region = np.linalg.norm(pos[:2] - ctx.place_center[:2]) <= ctx.place_radius
     above_table = pos[2] > (TABLE_Z + 0.005)
     return bool(in_region and above_table)
+
+
+def anomaly_landed_in_place(data: mujoco.MjData, ctx: SimContext) -> bool:
+    pos = data.xpos[ctx.anomaly_body_id].copy()
+    dadr = ctx.object_dof_adr["anomaly_0"]
+    in_region = np.linalg.norm(pos[:2] - ctx.place_center[:2]) <= ctx.place_radius
+    near_ground = TABLE_Z <= pos[2] <= (OBJECT_CENTER_Z_ON_BELT + 0.05)
+    low_vertical_speed = abs(float(data.qvel[dadr + 2])) < 0.03
+    return bool(in_region and near_ground and low_vertical_speed)
 
 
 def _jsonable(value):
@@ -1567,6 +1582,11 @@ def run_teleop_episode(
                 if teleop.discard_requested:
                     dataset.clear_episode_buffer(delete_images=True)
                     return False
+                if attached is None and anomaly_landed_in_place(data, ctx):
+                    dataset.save_episode()
+                    saved = True
+                    print("[teleop] auto-saved: anomaly landed in place region")
+                    break
 
                 now = time.time()
                 if now - last_log > 2.0:
