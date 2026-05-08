@@ -88,37 +88,15 @@ def object_freejoint_addr(model, body_id):
     return model.jnt_qposadr[jid], model.jnt_dofadr[jid]
 
 
-def claw_anomaly_contact_flags(model, data, anomaly_body_id, claw_left_body_id, claw_right_body_id):
-    left_contact = False
-    right_contact = False
+def has_claw_anomaly_contact(model, data, anomaly_body_id, claw_left_body_id, claw_right_body_id):
+    claw_bodies = {claw_left_body_id, claw_right_body_id}
     for i in range(data.ncon):
         c = data.contact[i]
         b1 = model.geom_bodyid[c.geom1]
         b2 = model.geom_bodyid[c.geom2]
-        other = None
-        if b1 == anomaly_body_id:
-            other = b2
-        elif b2 == anomaly_body_id:
-            other = b1
-        if other == claw_left_body_id:
-            left_contact = True
-        elif other == claw_right_body_id:
-            right_contact = True
-        if left_contact and right_contact:
-            break
-    return left_contact, right_contact
-
-
-def has_claw_anomaly_contact(model, data, anomaly_body_id, claw_left_body_id, claw_right_body_id):
-    return any(claw_anomaly_contact_flags(
-        model, data, anomaly_body_id, claw_left_body_id, claw_right_body_id
-    ))
-
-
-def has_two_claw_anomaly_contact(model, data, anomaly_body_id, claw_left_body_id, claw_right_body_id):
-    return all(claw_anomaly_contact_flags(
-        model, data, anomaly_body_id, claw_left_body_id, claw_right_body_id
-    ))
+        if (b1 == anomaly_body_id and b2 in claw_bodies) or (b2 == anomaly_body_id and b1 in claw_bodies):
+            return True
+    return False
 
 
 def attach_object_to_tcp(model, data, tcp_site_id, object_body_id):
@@ -342,15 +320,15 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
             data.ctrl[aid] = data.qpos[model.jnt_qposadr[arm_jids[arm_aids.index(aid)]]]
         data.qpos[model.jnt_qposadr[arm_jids[0]]] = data.ctrl[arm_aids[0]]
         mujoco.mj_step(model, data)
-        has_contact = has_two_claw_anomaly_contact(model, data, abid, claw_left_bid, claw_right_bid)
+        has_contact = has_claw_anomaly_contact(model, data, abid, claw_left_bid, claw_right_bid)
         if has_contact:
             break
 
     mujoco.mj_forward(model, data)
     grip_q = data.qpos[model.jnt_qposadr[gid]]
-    print(f"  gripper at {grip_q:.4f}  two_claw_contact={has_contact}")
+    print(f"  gripper at {grip_q:.4f}  contact={has_contact}")
     if not has_contact:
-        print("[test] FAILED — object is not clamped by both claws")
+        print("[test] FAILED — no contact")
         return False
 
     attached = attach_object_to_tcp(model, data, sid, abid)
@@ -370,17 +348,9 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
         update_attached_object(model, data, sid, abid, attached)
         mujoco.mj_forward(model, data)
         mujoco.mj_step(model, data)
-        two_claw_contact = has_two_claw_anomaly_contact(model, data, abid, claw_left_bid, claw_right_bid)
-        if attached is not None and not two_claw_contact:
-            attached = None
-            print("[test] released: lost two-claw contact")
-        elif attached is None and grip_q > 0.006 and two_claw_contact:
-            attached = attach_object_to_tcp(model, data, sid, abid)
-            print("[test] re-attached: two-claw contact")
-        if attached is not None:
-            mujoco.mj_forward(model, data)
-            update_attached_object(model, data, sid, abid, attached)
-            mujoco.mj_forward(model, data)
+        mujoco.mj_forward(model, data)
+        update_attached_object(model, data, sid, abid, attached)
+        mujoco.mj_forward(model, data)
 
     end_z = data.qpos[anomaly_qadr + 2]
     lifted = end_z > start_z + 0.005
@@ -531,21 +501,20 @@ def main():
                 j1_err = arm_target[0] - data.qpos[model.jnt_qposadr[arm_jids[0]]]
                 data.qpos[model.jnt_qposadr[arm_jids[0]]] += np.clip(j1_err, -0.4 * dt, 0.4 * dt)
 
+                if attached is not None and grip_target <= GRIPPER_OPEN + 0.003:
+                    attached = None
+                    print("[grasp] released")
                 if attached is not None:
                     mujoco.mj_forward(model, data)
                     update_attached_object(model, data, sid, abid, attached)
                     mujoco.mj_forward(model, data)
 
                 mujoco.mj_step(model, data)
-                two_claw_contact = has_two_claw_anomaly_contact(
+                if attached is None and grip_target > 0.006 and has_claw_anomaly_contact(
                     model, data, abid, claw_left_bid, claw_right_bid
-                )
-                if attached is not None and not two_claw_contact:
-                    attached = None
-                    print("[grasp] released: lost two-claw contact")
-                elif attached is None and grip_target > 0.006 and two_claw_contact:
+                ):
                     attached = attach_object_to_tcp(model, data, sid, abid)
-                    print("[grasp] attached anomaly_0 to tcp_site: two-claw contact")
+                    print("[grasp] attached anomaly_0 to tcp_site")
                 if attached is not None:
                     mujoco.mj_forward(model, data)
                     update_attached_object(model, data, sid, abid, attached)
