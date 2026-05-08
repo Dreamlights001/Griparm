@@ -4,6 +4,13 @@
 from __future__ import annotations
 
 import argparse
+# NOTE: debug_cameras (and thus cv2) MUST be imported before av and mujoco.viewer,
+# otherwise cv2 Qt windows will hang after those modules initialize their codecs/GL.
+from debug_cameras import get_home_pose_from_model
+from debug_cameras import PreviewBackend
+from debug_cameras import matrix_to_quat
+from debug_cameras import apply_lighting_for_debug
+
 import av
 from datetime import datetime
 import json
@@ -33,10 +40,6 @@ import mujoco.viewer
 import numpy as np
 import pandas as pd
 import glfw
-
-from debug_cameras import get_home_pose_from_model
-from debug_cameras import PreviewBackend
-from ledataset.datasets.lerobot_dataset import LeRobotDataset
 
 
 ARM_JOINTS = ["J_jianbu", "J_dabi", "J_Upper", "J_Lower", "J_wrist", "J_hand"]
@@ -76,6 +79,7 @@ DEFAULT_CAMERA_XML = Path("env_camera_tuned.xml")
 HIDDEN_OBJECT_QPOS = np.array([-2.0, -2.0, -1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 TELEOP_ARM_STEP = 0.015
 TELEOP_GRIPPER_STEP = 0.0015
+CALIB_GRASP_FILE = Path("calib_grasp.json")
 
 
 class PolicyState(Enum):
@@ -91,12 +95,15 @@ class EpisodeConfig:
     width: int = 256
     height: int = 256
     prediction_time: float = 0.5
-    pregrasp_height: float = 0.10
-    grasp_height: float = 0.03
+    pregrasp_height: float = 0.12
+    grasp_height: float = 0.06
+    descend_duration_sec: float = 0.7
+    tracking_xy_tol: float = 0.015
+    descend_xy_tol: float = 0.010
     grasp_hold_sec: float = 0.45
     release_hold_sec: float = 0.30
-    gripper_open: float = 0.038
-    gripper_closed: float = 0.002
+    gripper_open: float = 0.0     # URDF qpos0: claws apart
+    gripper_closed: float = 0.038  # near max: claws together
 
 
 @dataclass
@@ -106,10 +113,13 @@ class SimContext:
     arm_dof_adr: np.ndarray
     gripper_joint_id: int
     gripper_actuator_id: int
+    gripper_right_actuator_id: int
     arm_actuator_ids: list[int]
     tcp_site_id: int
     anomaly_body_id: int
     normal_body_ids: list[int]
+    claw_left_body_id: int
+    claw_right_body_id: int
     object_qpos_adr: dict[str, int]
     object_dof_adr: dict[str, int]
     home_qpos: np.ndarray
@@ -136,7 +146,11 @@ class PolicyContext:
     step_counter_in_state: int = 0
     last_target_quat: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64))
     hold_anomaly_on_conveyor: bool = False
-    anomaly_attached: bool = False
+    grasp_xy: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    descend_start_tcp_pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    grip_target: float = 0.0   # gradually ramped gripper target during GRASP
+    _prev_claw_q: float = 0.0  # for detecting when claws stop (contact made)
+    grasped: bool = False       # true after verified grip → kinematic hold
     last_ctrl: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=np.float64))
 
 
@@ -257,11 +271,16 @@ def prepare_collection_xml(src: Path) -> Path:
         if name.startswith("anomaly_") or name.startswith("normal_"):
             geom.attrib.setdefault("contype", "1")
             geom.attrib.setdefault("conaffinity", "1")
-            geom.attrib["friction"] = "0.7 0.005 0.0001"
-            geom.attrib["condim"] = "4"
+            geom.attrib["condim"] = "6"
+            geom.attrib["friction"] = "1.0 0.05 0.005"
+            geom.attrib["solref"] = "0.01 1"
+            geom.attrib["solimp"] = "0.9 0.99 0.001"
         elif name in {"Claw_Link_left", "Claw_Link_right"}:
-            geom.attrib["friction"] = "0.7 0.005 0.0001"
-            geom.attrib["condim"] = "4"
+            geom.attrib["condim"] = "6"
+            geom.attrib["friction"] = "1.5 0.2 0.02"
+            geom.attrib["solref"] = "0.02 1"
+            geom.attrib["solimp"] = "0.9 0.95 0.003"
+            geom.attrib["margin"] = "0.0005"
 
     _indent(root)
     fd, tmp_path = tempfile.mkstemp(prefix="collect_", suffix=".xml")
@@ -342,15 +361,18 @@ def solve_ik_dls(
     damping: float = 0.01,
     pos_tol: float = 5e-4,
     rot_tol: float = 2e-2,
+    max_dq_per_step: float = 0.10,
 ) -> np.ndarray:
     target_rot = mat_from_quat_wxyz(target_quat)
-    q = data.qpos[arm_qpos_adr].copy()
+    q_orig = data.qpos[arm_qpos_adr].copy()
+    q = q_orig.copy()
 
     jacp = np.zeros((3, model.nv), dtype=np.float64)
     jacr = np.zeros((3, model.nv), dtype=np.float64)
     i6 = np.eye(6, dtype=np.float64)
 
     for _ in range(max_iter):
+        data.qpos[arm_qpos_adr] = q
         mujoco.mj_forward(model, data)
         curr_pos = data.site_xpos[site_id].copy()
         curr_rot = data.site_xmat[site_id].reshape(3, 3).copy()
@@ -368,9 +390,16 @@ def solve_ik_dls(
         dq = j.T @ np.linalg.solve(a, err)
         dq = np.clip(dq, -0.03, 0.03)
         q = q + dq
-        data.qpos[arm_qpos_adr] = q
 
-    return q
+    # Restore original qpos; return a rate-limited target so the arm
+    # moves smoothly via actuators instead of jumping kinematically.
+    data.qpos[arm_qpos_adr] = q_orig
+    mujoco.mj_forward(model, data)
+
+    # Clip per-joint displacement to max_dq_per_step for smooth motion
+    dq_total = q - q_orig
+    dq_total = np.clip(dq_total, -max_dq_per_step, max_dq_per_step)
+    return q_orig + dq_total
 
 
 def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
@@ -395,6 +424,9 @@ def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
     gripper_actuator_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "Claw_left_pos")
     if gripper_actuator_id < 0:
         raise RuntimeError("Actuator Claw_left_pos missing in env.xml.")
+    gripper_right_actuator_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "Claw_right_pos")
+    if gripper_right_actuator_id < 0:
+        raise RuntimeError("Actuator Claw_right_pos missing in env.xml.")
 
     tcp_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "tcp_site")
     if tcp_site_id < 0:
@@ -403,6 +435,11 @@ def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
     anomaly_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "anomaly_0")
     if anomaly_body_id < 0:
         raise RuntimeError("anomaly_0 body missing in env.xml.")
+
+    claw_left_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_left")
+    claw_right_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_right")
+    if claw_left_body_id < 0 or claw_right_body_id < 0:
+        raise RuntimeError("Claw_Link_left or Claw_Link_right body missing in env.xml.")
 
     normal_body_ids = []
     for i in range(5):
@@ -450,10 +487,13 @@ def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
         arm_dof_adr=arm_dof_adr,
         gripper_joint_id=gripper_joint_id,
         gripper_actuator_id=gripper_actuator_id,
+        gripper_right_actuator_id=gripper_right_actuator_id,
         arm_actuator_ids=arm_actuator_ids,
         tcp_site_id=tcp_site_id,
         anomaly_body_id=anomaly_body_id,
         normal_body_ids=normal_body_ids,
+        claw_left_body_id=claw_left_body_id,
+        claw_right_body_id=claw_right_body_id,
         object_qpos_adr=object_qpos_adr,
         object_dof_adr=object_dof_adr,
         home_qpos=home_qpos,
@@ -488,17 +528,33 @@ def enforce_camera_binding(model: mujoco.MjModel) -> None:
 
 
 def desired_gripper_quat_for_object(data: mujoco.MjData, anomaly_body_id: int) -> np.ndarray:
-    # Align gripper with the horizontal cylinder axis, and point tool downwards.
+    # Construct gripper orientation from explicit axes:
+    #   Z = approach direction (forward + down toward conveyor)
+    #   X = grip direction (perpendicular to object major axis, horizontal)
+    #   Y = orthogonal to X and Z
     body_rot = data.xmat[anomaly_body_id].reshape(3, 3)
-    axis = body_rot[:, 2].copy()
-    axis[2] = 0.0
-    if np.linalg.norm(axis) < 1e-8:
-        axis = body_rot[:, 0].copy()
-        axis[2] = 0.0
-    axis = normalize(axis)
-    obj_yaw = math.atan2(axis[1], axis[0])
-    yaw = obj_yaw + math.pi / 2.0
-    return quat_from_euler_xyz(math.pi, 0.0, yaw)
+    obj_axis = body_rot[:, 2].copy()
+    obj_axis[2] = 0.0
+    if np.linalg.norm(obj_axis) < 1e-8:
+        obj_axis = body_rot[:, 0].copy()
+        obj_axis[2] = 0.0
+    obj_axis = normalize(obj_axis)
+
+    # Grip X axis: perpendicular to object axis, horizontal (claws grip from sides).
+    grip_x = np.cross(obj_axis, np.array([0.0, 0.0, 1.0], dtype=np.float64))
+    if np.linalg.norm(grip_x) < 1e-6:
+        grip_x = np.cross(obj_axis, np.array([0.0, 1.0, 0.0], dtype=np.float64))
+    grip_x = normalize(grip_x)
+
+    # Approach Z axis: diagonal forward+down so wrist clears conveyor.
+    approach_z = normalize(np.array([0.5, 0.0, -1.0], dtype=np.float64))
+
+    # Orthonormal basis: Y = Z × X, then re-orthogonalize X = Y × Z.
+    grip_y = normalize(np.cross(approach_z, grip_x))
+    grip_x = normalize(np.cross(grip_y, approach_z))
+
+    rot = np.column_stack([grip_x, grip_y, approach_z])
+    return matrix_to_quat(rot)
 
 
 def object_quat_laid_down(conveyor_dir: np.ndarray, object_yaw_deg: float) -> np.ndarray:
@@ -542,6 +598,7 @@ def settle_spawned_objects(
     for i, aid in enumerate(ctx.arm_actuator_ids):
         data.ctrl[aid] = arm_home[i]
     data.ctrl[ctx.gripper_actuator_id] = gripper_home
+    data.ctrl[ctx.gripper_right_actuator_id] = -gripper_home
 
     for _ in range(steps):
         mujoco.mj_step(model, data)
@@ -560,6 +617,7 @@ def set_ctrl_from_targets(
         data.ctrl[aid] = ctrl[i]
     ctrl[6] = gripper_target
     data.ctrl[ctx.gripper_actuator_id] = gripper_target
+    data.ctrl[ctx.gripper_right_actuator_id] = -gripper_target
     return ctrl
 
 
@@ -569,6 +627,38 @@ def teleop_policy(
     state: TeleopState,
 ) -> np.ndarray:
     return set_ctrl_from_targets(data, ctx, state.arm_target, state.gripper_target)
+
+
+def load_grasp_calibration(path: Path = CALIB_GRASP_FILE) -> dict[str, np.ndarray] | None:
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    calib = {}
+    if "tcp_to_object" in raw:
+        calib["tcp_to_object"] = np.array(raw["tcp_to_object"], dtype=np.float64)
+    if "object_axis_xy" in raw:
+        calib["object_axis_xy"] = np.array(raw["object_axis_xy"], dtype=np.float64)
+    return calib if calib else None
+
+
+def compute_grasp_target_from_calibration(
+    data: mujoco.MjData,
+    anomaly_body_id: int,
+    calibration: dict[str, np.ndarray] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    object_pos = data.xpos[anomaly_body_id].copy()
+    target_quat = desired_gripper_quat_for_object(data, anomaly_body_id)
+
+    if not calibration or "tcp_to_object" not in calibration:
+        fallback = object_pos + np.array([0.0, 0.0, 0.06], dtype=np.float64)
+        return fallback, target_quat
+
+    tcp_to_object = calibration["tcp_to_object"].copy()
+    target_pos = object_pos - tcp_to_object
+    return target_pos, target_quat
 
 
 def glfw_key_to_token(keycode: int) -> str | None:
@@ -593,9 +683,26 @@ def glfw_key_to_token(keycode: int) -> str | None:
         glfw.KEY_O: "O",
         glfw.KEY_P: "P",
         glfw.KEY_U: "U",
+        glfw.KEY_W: "W",
+        glfw.KEY_D: "D",
+        glfw.KEY_S: "S",
         glfw.KEY_A: "A",
-        glfw.KEY_X: "X",
-        glfw.KEY_M: "M",
+        glfw.KEY_UP: "UP",
+        glfw.KEY_DOWN: "DOWN",
+        glfw.KEY_LEFT: "LEFT",
+        glfw.KEY_RIGHT: "RIGHT",
+        glfw.KEY_KP_1: "KP_1",
+        glfw.KEY_KP_2: "KP_2",
+        glfw.KEY_KP_4: "KP_4",
+        glfw.KEY_KP_5: "KP_5",
+        glfw.KEY_KP_6: "KP_6",
+        glfw.KEY_KP_7: "KP_7",
+        glfw.KEY_KP_8: "KP_8",
+        glfw.KEY_KP_9: "KP_9",
+        glfw.KEY_KP_ADD: "KP_ADD",
+        glfw.KEY_KP_SUBTRACT: "KP_SUBTRACT",
+        glfw.KEY_KP_DECIMAL: "KP_DECIMAL",
+        glfw.KEY_KP_ENTER: "KP_ENTER",
     }
     return mapping.get(keycode)
 
@@ -611,11 +718,19 @@ def expert_policy(
     anomaly_pos = data.xpos[ctx.anomaly_body_id].copy()
     predicted_pos = anomaly_pos + ctx.conveyor_dir * (anomaly_conveyor_speed * cfg.prediction_time)
     tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+    calibration = load_grasp_calibration()
+    grasp_target_pos, grasp_target_quat = compute_grasp_target_from_calibration(
+        data, ctx.anomaly_body_id, calibration
+    )
+    pregrasp_target_pos = grasp_target_pos.copy()
+    pregrasp_target_pos[2] = max(pregrasp_target_pos[2] + cfg.pregrasp_height, tcp_pos[2], 0.10)
 
     if policy.state == PolicyState.TRACKING:
         policy.step_counter_in_state += 1
-        target_pos = predicted_pos + np.array([0.0, 0.0, cfg.pregrasp_height], dtype=np.float64)
-        target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
+        # High-level horizontal tracking first: align XY above the predicted grasp point
+        # before committing to the final grasp descent.
+        target_pos = pregrasp_target_pos
+        target_quat = grasp_target_quat
         arm_q = solve_ik_dls(
             model,
             data,
@@ -629,17 +744,27 @@ def expert_policy(
             pos_tol=5e-4,
         )
         ctrl = set_ctrl_from_targets(data, ctx, arm_q, cfg.gripper_open)
-        if np.linalg.norm(tcp_pos - target_pos) < 0.015 or policy.step_counter_in_state >= int(1.5 * PHYSICS_HZ):
+        xy_err = np.linalg.norm((tcp_pos - target_pos)[:2])
+        z_ok = abs(tcp_pos[2] - target_pos[2]) < 0.03
+        if (xy_err < cfg.tracking_xy_tol and z_ok) or policy.step_counter_in_state >= int(2.0 * PHYSICS_HZ):
             policy.state = PolicyState.DESCEND
             policy.step_counter_in_state = 0
+            policy.descend_start_tcp_pos = tcp_pos.copy()
         policy.last_target_quat = target_quat
         policy.last_ctrl = ctrl
         return ctrl
 
     if policy.state == PolicyState.DESCEND:
         policy.step_counter_in_state += 1
-        target_pos = predicted_pos + np.array([0.0, 0.0, cfg.grasp_height], dtype=np.float64)
-        target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
+        # Descend while continuing to track the moving target in XY.
+        descend_alpha = min(1.0, policy.step_counter_in_state / max(1, int(cfg.descend_duration_sec * PHYSICS_HZ)))
+        grasp_target_pos, target_quat = compute_grasp_target_from_calibration(
+            data, ctx.anomaly_body_id, calibration
+        )
+        start = policy.descend_start_tcp_pos if np.linalg.norm(policy.descend_start_tcp_pos) > 0 else tcp_pos.copy()
+        tracked_xy = (1.0 - descend_alpha) * start[:2] + descend_alpha * grasp_target_pos[:2]
+        tracked_z = (1.0 - descend_alpha) * start[2] + descend_alpha * grasp_target_pos[2]
+        target_pos = np.array([tracked_xy[0], tracked_xy[1], tracked_z], dtype=np.float64)
         arm_q = solve_ik_dls(
             model,
             data,
@@ -653,75 +778,121 @@ def expert_policy(
             pos_tol=5e-4,
         )
         ctrl = set_ctrl_from_targets(data, ctx, arm_q, cfg.gripper_open)
-        if np.linalg.norm(tcp_pos - target_pos) < 0.010 or policy.step_counter_in_state >= int(1.2 * PHYSICS_HZ):
+        xy_err = np.linalg.norm((tcp_pos - target_pos)[:2])
+        z_err = abs(tcp_pos[2] - target_pos[2])
+        if (xy_err < cfg.descend_xy_tol and z_err < 0.012 and descend_alpha > 0.7) or \
+           policy.step_counter_in_state >= int(1.5 * PHYSICS_HZ):
             policy.state = PolicyState.GRASP
             policy.step_counter_in_state = 0
             policy.hold_anomaly_on_conveyor = True
+            # Start closing from current (open) position.
+            policy.grip_target = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]] + 0.001
+            policy._prev_claw_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
         policy.last_target_quat = target_quat
         policy.last_ctrl = ctrl
         return ctrl
 
     if policy.state == PolicyState.GRASP:
         policy.step_counter_in_state += 1
-        ctrl = set_ctrl_from_targets(data, ctx, data.qpos[ctx.arm_qpos_adr].copy(), cfg.gripper_closed)
+        # Gradually close gripper — avoid overshoot that pushes the object away.
+        grip_speed = 0.0003  # per step (~0.15/s at 500 Hz)
+        policy.grip_target = min(cfg.gripper_closed, policy.grip_target + grip_speed)
+        ctrl = set_ctrl_from_targets(data, ctx, data.qpos[ctx.arm_qpos_adr].copy(), policy.grip_target)
+
+        # Track claw motion to detect contact stall.
+        claw_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
+        claw_stalled = abs(claw_q - policy._prev_claw_q) < 1e-7
+        policy._prev_claw_q = claw_q
+
+        # Check contact with anomaly.
+        has_contact = False
+        for i in range(data.ncon):
+            c = data.contact[i]
+            b1 = model.geom_bodyid[c.geom1]
+            b2 = model.geom_bodyid[c.geom2]
+            claw_bodies = {ctx.claw_left_body_id, ctx.claw_right_body_id}
+            if (b1 == ctx.anomaly_body_id and b2 in claw_bodies) or \
+               (b2 == ctx.anomaly_body_id and b1 in claw_bodies):
+                has_contact = True
+                break
+
         hold_steps = int(cfg.grasp_hold_sec * PHYSICS_HZ)
-        if policy.step_counter_in_state >= hold_steps:
+        # Success: claws stalled on object AND contact confirmed.
+        grasped = claw_stalled and has_contact and policy.grip_target > claw_q + 0.001
+        if grasped:
+            policy.grip_target = claw_q   # freeze: don't close further
+            policy.grasped = True          # enable kinematic hold during transport
             policy.state = PolicyState.LIFT_PLACE
             policy.lift_place_phase = 0
             policy.step_counter_in_state = 0
-            policy.anomaly_attached = True
+            policy.grasp_xy = anomaly_pos[:2].copy()
+        elif policy.step_counter_in_state >= hold_steps:
+            # Timeout — grasp failed (claws closed fully on empty space).
+            policy.state = PolicyState.DONE
+            policy.hold_anomaly_on_conveyor = False
         policy.last_ctrl = ctrl
         return ctrl
 
     if policy.state == PolicyState.LIFT_PLACE:
         policy.step_counter_in_state += 1
         target_quat = policy.last_target_quat
+
+        # Interpolated trajectory:
+        # Phase 0: lift XY=grasp, Z=grasp→0.20  (0.5s)
+        # Phase 1: move XY=grasp→place, Z=0.20  (1.0s)
+        # Phase 2: descend XY=place, Z=0.20→0.09 (0.5s)
+        # Phase 3: release, keep position  (0.5s)
+        lift_steps = int(0.5 * PHYSICS_HZ)
+        move_steps = int(1.0 * PHYSICS_HZ)
+        descend_steps = int(0.5 * PHYSICS_HZ)
+        release_steps = int(0.5 * PHYSICS_HZ)
+
         if policy.lift_place_phase == 0:
-            target_pos = np.array([anomaly_pos[0], anomaly_pos[1], 0.20], dtype=np.float64)
+            t = min(1.0, policy.step_counter_in_state / lift_steps)
+            z = 0.03 + t * (0.20 - 0.03)
+            x, y = policy.grasp_xy[0], policy.grasp_xy[1]
         elif policy.lift_place_phase == 1:
-            target_pos = np.array([ctx.place_center[0], ctx.place_center[1], 0.20], dtype=np.float64)
+            t = min(1.0, policy.step_counter_in_state / move_steps)
+            x = policy.grasp_xy[0] + t * (ctx.place_center[0] - policy.grasp_xy[0])
+            y = policy.grasp_xy[1] + t * (ctx.place_center[1] - policy.grasp_xy[1])
+            z = 0.20
         elif policy.lift_place_phase == 2:
-            target_pos = np.array([ctx.place_center[0], ctx.place_center[1], 0.09], dtype=np.float64)
-        else:
-            target_pos = np.array([ctx.place_center[0], ctx.place_center[1], 0.09], dtype=np.float64)
+            t = min(1.0, policy.step_counter_in_state / descend_steps)
+            z = 0.20 + t * (0.09 - 0.20)
+            x, y = ctx.place_center[0], ctx.place_center[1]
+        else:  # phase 3: hold position, gripper open
+            x, y, z = ctx.place_center[0], ctx.place_center[1], 0.09
+
+        target_pos = np.array([x, y, z], dtype=np.float64)
 
         arm_q = solve_ik_dls(
-            model,
-            data,
-            ctx.tcp_site_id,
-            target_pos,
-            target_quat,
-            ctx.arm_qpos_adr,
-            ctx.arm_dof_adr,
-            max_iter=100,
-            damping=0.01,
-            pos_tol=5e-4,
+            model, data, ctx.tcp_site_id, target_pos, target_quat,
+            ctx.arm_qpos_adr, ctx.arm_dof_adr,
+            max_iter=50, damping=0.01, pos_tol=5e-4,
         )
 
-        gripper_target = cfg.gripper_closed if policy.lift_place_phase < 3 else cfg.gripper_open
+        # Gripper: hold at grip position during lift/move/descend, open during release.
+        gripper_target = cfg.gripper_open if policy.lift_place_phase >= 3 else policy.grip_target
         ctrl = set_ctrl_from_targets(data, ctx, arm_q, gripper_target)
-        if policy.lift_place_phase >= 3:
-            policy.anomaly_attached = False
-            policy.hold_anomaly_on_conveyor = False
 
+        # Phase transitions
+        phase_steps = {0: lift_steps, 1: move_steps, 2: descend_steps, 3: release_steps}
         dist = np.linalg.norm(data.site_xpos[ctx.tcp_site_id] - target_pos)
         if policy.lift_place_phase < 3 and (
-            dist < 0.015 or policy.step_counter_in_state >= int(1.5 * PHYSICS_HZ)
+            dist < 0.02 or policy.step_counter_in_state >= phase_steps.get(policy.lift_place_phase, 9999)
         ):
             policy.lift_place_phase += 1
             policy.step_counter_in_state = 0
         elif policy.lift_place_phase >= 3:
-            release_steps = int(cfg.release_hold_sec * PHYSICS_HZ)
             if policy.step_counter_in_state >= release_steps:
                 policy.state = PolicyState.DONE
                 policy.hold_anomaly_on_conveyor = False
-                snap_anomaly_to_place(data, ctx)
         policy.last_ctrl = ctrl
         return ctrl
 
-    # DONE: keep posture and gripper open.
+    # DONE: keep posture, gripper open, release kinematic hold.
     ctrl = set_ctrl_from_targets(data, ctx, data.qpos[ctx.arm_qpos_adr].copy(), cfg.gripper_open)
-    policy.anomaly_attached = False
+    policy.grasped = False
     policy.last_ctrl = ctrl
     return ctrl
 
@@ -747,6 +918,7 @@ def reset_episode(
     for i, aid in enumerate(ctx.arm_actuator_ids):
         data.ctrl[aid] = arm_home[i]
     data.ctrl[ctx.gripper_actuator_id] = gripper_home
+    data.ctrl[ctx.gripper_right_actuator_id] = -gripper_home
 
     active_normals = rng.sample([f"normal_{i}" for i in range(5)], k=VISIBLE_SAMPLE_COUNT - 1)
     active = {"anomaly_0", *active_normals}
@@ -800,7 +972,9 @@ def move_conveyor_objects(
 
         s_new = s - CONVEYOR_SPEED * dt
         target_pos = ctx.conveyor_start + ctx.conveyor_dir * s_new + ctx.conveyor_lateral * lat
-        data.qpos[qadr : qadr + 3] = np.array([target_pos[0], target_pos[1], pos[2]], dtype=np.float64)
+        # Only drive XY (conveyor motion); Z is free for pickup.
+        data.qpos[qadr] = target_pos[0]
+        data.qpos[qadr + 1] = target_pos[1]
 
         if s_new < -RESPAWN_MARGIN:
             s_respawn = rng.uniform(*OBJECT_SPAWN_S_RANGE)
@@ -834,30 +1008,8 @@ def ensure_offscreen_buffer(model: mujoco.MjModel, width: int, height: int) -> N
     model.vis.global_.offheight = max(int(model.vis.global_.offheight), int(height))
 
 
-def update_attached_anomaly(data: mujoco.MjData, ctx: SimContext, policy: PolicyContext) -> None:
-    """Kinematically keep anomaly under the TCP while gripper is in carrying phase."""
-    if not policy.anomaly_attached:
-        return
-    tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
-    tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3).copy()
-    local_offset = np.array([0.0, 0.0, -0.055], dtype=np.float64)
-    world_offset = tcp_rot @ local_offset
-
-    qadr = ctx.object_qpos_adr["anomaly_0"]
-    dadr = ctx.object_dof_adr["anomaly_0"]
-    data.qpos[qadr : qadr + 3] = tcp_pos + world_offset
-    data.qpos[qadr + 3 : qadr + 7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-    data.qvel[dadr : dadr + 6] = 0.0
-
-
-def snap_anomaly_to_place(data: mujoco.MjData, ctx: SimContext) -> None:
-    qadr = ctx.object_qpos_adr["anomaly_0"]
-    dadr = ctx.object_dof_adr["anomaly_0"]
-    data.qpos[qadr : qadr + 7] = np.array([ctx.place_center[0], ctx.place_center[1], 0.03, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-    data.qvel[dadr : dadr + 6] = 0.0
-
-
-def make_dataset(root_dir: Path, fps: int, width: int, height: int) -> LeRobotDataset:
+def make_dataset(root_dir: Path, fps: int, width: int, height: int) -> "LeRobotDataset":
+    from ledataset.datasets.lerobot_dataset import LeRobotDataset
     features = {
         "observation.state": {
             "dtype": "float32",
@@ -950,6 +1102,52 @@ def _trim_video_segment(src: Path, dst: Path, start_s: float, end_s: float) -> N
 
             for packet in out_stream.encode():
                 out_container.mux(packet)
+
+
+def _merge_resume_backup(new_root: Path, backup_root: Path) -> None:
+    """Merge episodes from a backup dataset into the new dataset root."""
+    import pandas as pd
+    meta_dir = new_root / "meta" / "episodes"
+    new_ep_files = sorted(meta_dir.glob("chunk-*/file-*.parquet"))
+    if not new_ep_files:
+        max_ep = -1
+    else:
+        new_eps = pd.concat([pd.read_parquet(p) for p in new_ep_files], ignore_index=True)
+        max_ep = int(new_eps["episode_index"].max()) if "episode_index" in new_eps.columns else -1
+
+    backup_meta = backup_root / "meta" / "episodes"
+    backup_ep_files = sorted(backup_meta.glob("chunk-*/file-*.parquet"))
+    if backup_ep_files:
+        old_eps = pd.concat([pd.read_parquet(p) for p in backup_ep_files], ignore_index=True)
+        old_eps["episode_index"] = old_eps["episode_index"] + max_ep + 1
+        # Write merged episodes into new dataset
+        new_chunk = meta_dir / "chunk-000"
+        new_chunk.mkdir(parents=True, exist_ok=True)
+        out_pq = new_chunk / "file-000.parquet"
+        old_eps.to_parquet(out_pq, index=False)
+
+    # Copy old videos with renumbered indices
+    for cam in ("wrist", "global"):
+        old_videos = sorted((backup_root / "videos" / cam).glob("episode_*.mp4"))
+        for vf in old_videos:
+            old_idx = int(vf.stem.split("_")[-1])
+            new_idx = old_idx + max_ep + 1
+            dst = new_root / "videos" / cam / f"episode_{new_idx:06d}.mp4"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(vf, dst)
+
+    # Copy old parquet data files
+    old_data_dir = backup_root / "data" / "chunk-000"
+    if old_data_dir.exists():
+        for pf in sorted(old_data_dir.glob("episode_*.parquet")):
+            old_idx = int(pf.stem.split("_")[-1])
+            new_idx = old_idx + max_ep + 1
+            dst = new_root / "data" / "chunk-000" / f"episode_{new_idx:06d}.parquet"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pf, dst)
+
+    shutil.rmtree(backup_root, ignore_errors=True)
+    print(f"[collect_data] Merged backup episodes into {new_root}")
 
 
 def export_legacy_layout(dataset_root: Path) -> None:
@@ -1058,6 +1256,7 @@ def run_episode(
     ctx: SimContext,
     cfg: EpisodeConfig,
     rng: random.Random,
+    viewer: object | None = None,
 ) -> bool:
     active_objects = reset_episode(model, data, ctx, rng, cfg)
     policy = PolicyContext()
@@ -1075,8 +1274,25 @@ def run_episode(
             cfg=cfg,
             anomaly_conveyor_speed=CONVEYOR_SPEED,
         )
-        update_attached_anomaly(data, ctx, policy)
+        j1_err = ctrl[0] - data.qpos[ctx.arm_qpos_adr[0]]
+        data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.005, 0.005)
+
+        # Hold object at TCP whenever gripper is partially closed.
+        grip_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
+        if grip_q > 0.005:
+            tcp = data.site_xpos[ctx.tcp_site_id].copy()
+            tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3)
+            world_offset = tcp_rot @ np.array([0.0, 0.0, 0.03], dtype=np.float64)
+            qadr = ctx.object_qpos_adr["anomaly_0"]
+            dadr = ctx.object_dof_adr["anomaly_0"]
+            data.qpos[qadr:qadr + 3] = tcp + world_offset
+            data.qvel[dadr:dadr + 6] = 0
+            mujoco.mj_forward(model, data)  # update contacts with new object pos
+
         mujoco.mj_step(model, data)
+
+        if viewer is not None and viewer.is_running():
+            viewer.sync()
 
         if step % SAMPLE_EVERY == 0:
             capture_dataset_frame(model, data, renderer, dataset, ctx, ctrl)
@@ -1102,39 +1318,48 @@ def handle_teleop_token(
     cfg: EpisodeConfig,
 ) -> None:
     mapping = {
-        "1": (0, +TELEOP_ARM_STEP),
-        "U": (0, -TELEOP_ARM_STEP),
-        "2": (1, +TELEOP_ARM_STEP),
-        "I": (1, -TELEOP_ARM_STEP),
-        "3": (2, +TELEOP_ARM_STEP),
-        "O": (2, -TELEOP_ARM_STEP),
-        "4": (3, +TELEOP_ARM_STEP),
-        "P": (3, -TELEOP_ARM_STEP),
-        "5": (4, +TELEOP_ARM_STEP),
-        "J": (4, -TELEOP_ARM_STEP),
-        "6": (5, +TELEOP_ARM_STEP),
-        "K": (5, -TELEOP_ARM_STEP),
+        # J1 (J_jianbu, base rotation): LEFT / RIGHT arrows
+        "LEFT":  (0, -TELEOP_ARM_STEP),
+        "RIGHT": (0, +TELEOP_ARM_STEP),
+        # J2 (J_dabi, shoulder lift): UP / DOWN arrows
+        "UP":   (1, +TELEOP_ARM_STEP),
+        "DOWN": (1, -TELEOP_ARM_STEP),
+        # J3 (J_Upper): numpad 1 / 2
+        "KP_1": (2, -TELEOP_ARM_STEP),
+        "KP_2": (2, +TELEOP_ARM_STEP),
+        # J4 (J_Lower): numpad 4 / 6
+        "KP_4": (3, +TELEOP_ARM_STEP),
+        "KP_6": (3, -TELEOP_ARM_STEP),
+        # J5 (J_wrist): numpad 5 / 8
+        "KP_5": (4, -TELEOP_ARM_STEP),
+        "KP_8": (4, +TELEOP_ARM_STEP),
+        # J6 (J_hand): numpad 7 / 9
+        "KP_7": (5, +TELEOP_ARM_STEP),
+        "KP_9": (5, -TELEOP_ARM_STEP),
+        # J7 gripper (URDF: qpos0=0=open, 0.04=closed)
+        "KP_SUBTRACT": (6, +TELEOP_GRIPPER_STEP),  # close (→0.04)
+        "KP_ADD":      (6, -TELEOP_GRIPPER_STEP),  # open  (→0)
     }
     if token in mapping:
         idx, delta = mapping[token]
-        teleop.arm_target[idx] += delta
-        return
-    if token == "7":
-        teleop.gripper_target = max(cfg.gripper_closed, teleop.gripper_target - TELEOP_GRIPPER_STEP)
-        return
-    if token == "L":
-        teleop.gripper_target = min(cfg.gripper_open, teleop.gripper_target + TELEOP_GRIPPER_STEP)
+        if idx < 6:
+            teleop.arm_target[idx] += delta
+        else:
+            teleop.gripper_target += delta
+            lo = min(cfg.gripper_open, cfg.gripper_closed)
+            hi = max(cfg.gripper_open, cfg.gripper_closed)
+            teleop.gripper_target = max(lo, min(hi, teleop.gripper_target))
         return
     if token == "8":
         teleop.paused = not teleop.paused
         return
-    if token == "9":
+    if token in {"ENTER", "KP_ENTER"}:
         teleop.save_requested = True
         return
-    if token == "0":
+    if token in {"0", "KP_DECIMAL"}:
         teleop.discard_requested = True
         return
-    if token in {"ENTER", "ESC"}:
+    if token == "ESC":
         teleop.exit_requested = True
 
 
@@ -1156,27 +1381,43 @@ def run_teleop_episode(
     preview_backend: str,
 ) -> bool:
     active_objects = reset_episode(model, data, ctx, rng, cfg)
+    arm_home = ctx.home_qpos[ctx.arm_qpos_adr].copy()
+    # URDF qpos0=0 means gripper OPEN (claws apart). Start teleop with gripper open.
+    gripper_start = cfg.gripper_open  # = 0.0
+    data.qpos[ctx.arm_qpos_adr] = arm_home
+    data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]] = gripper_start    # 0 = open
+    data.qpos[model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "claw_right")]] = 0.0
+    data.qvel[ctx.arm_dof_adr] = 0.0
+    data.qvel[model.jnt_dofadr[ctx.gripper_joint_id]] = 0.0
+    for i, aid in enumerate(ctx.arm_actuator_ids):
+        data.ctrl[aid] = arm_home[i]
+    data.ctrl[ctx.gripper_actuator_id] = gripper_start     # 0 = open
+    data.ctrl[ctx.gripper_right_actuator_id] = 0.0          # right also open at 0
+    mujoco.mj_forward(model, data)
     teleop = TeleopState(
-        arm_target=data.qpos[ctx.arm_qpos_adr].copy(),
-        gripper_target=float(data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]),
+        arm_target=arm_home.copy(),
+        gripper_target=gripper_start,
     )
     sample_count = 0
     last_log = 0.0
     preview = PreviewBackend.create_auto(preview_backend)
     saved = False
-    key_events: queue.SimpleQueue[tuple[str, int]] = queue.SimpleQueue()
+    # Thread-safe key event queue (populated by GLFW callback in viewer thread).
+    # We drain it fully each frame, applying deltas per event.
+    # Simultaneous keys produce independent events — all get processed.
+    key_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
 
     print(
-        "[teleop] MuJoCo window keys: "
-        "1/U 2/I 3/O 4/P 5/J 6/K control joints +/- ; "
-        "7/L close/open gripper ; 8 pause belt ; 9 save ; 0 discard ; ENTER or ESC quit"
+        "[teleop] Keys: LEFT/RIGHT(J1)  UP/DOWN(J2)  "
+        "numpad 1/2(J3)  numpad 4/6(J4)  numpad 5/8(J5)  numpad 7/9(J6)  numpad -/+(gripper) ; "
+        "ENTER=save  numpad .=discard  8=pause  ESC=quit"
     )
 
     def on_key(keycode: int) -> None:
         token = glfw_key_to_token(keycode)
         if token is None:
             return
-        key_events.put((token, keycode))
+        key_queue.put(token)
 
     try:
         with mujoco.viewer.launch_passive(
@@ -1190,13 +1431,21 @@ def run_teleop_episode(
                 if not viewer.is_running():
                     break
 
+                # Drain ALL queued key events and deduplicate per frame.
+                # Each unique key applies its delta once this frame.
+                seen: set[str] = set()
                 while True:
                     try:
-                        token, keycode = key_events.get_nowait()
+                        token = key_queue.get_nowait()
                     except queue.Empty:
                         break
+                    seen.add(token)
+                for token in seen:
                     handle_teleop_token(token, teleop, cfg)
                 clamp_teleop_targets(model, ctx, teleop)
+
+                j1_err = teleop.arm_target[0] - data.qpos[ctx.arm_qpos_adr[0]]
+                data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.005, 0.005)
 
                 if not teleop.paused:
                     move_conveyor_objects(model, data, ctx, active_objects, False, rng)
@@ -1271,6 +1520,12 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Collection mode: autonomous expert or manual teleoperation.",
     )
+    parser.add_argument("--no-viewer", action="store_true",
+                        help="Hide MuJoCo viewer window (auto mode only).")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Remove existing dataset directory before collecting (default).")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume appending episodes to an existing dataset directory.")
     parser.add_argument(
         "--preview-backend",
         choices=["auto", "cv2", "matplotlib"],
@@ -1317,6 +1572,7 @@ def main() -> None:
     try:
         model = mujoco.MjModel.from_xml_path(str(tmp_xml))
         model.opt.timestep = 1.0 / PHYSICS_HZ
+        apply_lighting_for_debug(model)
         enforce_camera_binding(model)
         ensure_offscreen_buffer(model, args.width, args.height)
         data = mujoco.MjData(model)
@@ -1326,25 +1582,40 @@ def main() -> None:
         renderer = mujoco.Renderer(model, width=args.width, height=args.height)
 
         args.dataset_root = resolve_default_dataset_root(args.dataset_root)
+        _resume_backup: Path | None = None
         if args.dataset_root.exists():
-            raise FileExistsError(
-                f"Dataset root already exists: {args.dataset_root}. "
-                "Remove it or choose another --dataset-root."
-            )
+            if args.resume:
+                # Resume: move existing data aside, create fresh, merge back later.
+                _resume_backup = args.dataset_root.with_name(args.dataset_root.name + "_resume_backup")
+                if _resume_backup.exists():
+                    shutil.rmtree(_resume_backup)
+                shutil.move(str(args.dataset_root), str(_resume_backup))
+                print(f"[collect_data] Resuming from existing dataset (backup at {_resume_backup})")
+            else:
+                # Default: overwrite.
+                shutil.rmtree(args.dataset_root)
+                print(f"[collect_data] Removed existing dataset at {args.dataset_root}")
         print(
             f"[collect_data] xml={args.xml} prepared_xml={tmp_xml} "
             f"dataset_root={args.dataset_root} mode={args.mode}"
         )
         print(
-            "[collect_data] physics: gravity=0 0 -9.81, "
-            "belt_friction=0.8, object/gripper_friction=0.7, condim=4(objects/claw)"
+            "[collect_data] physics: cone=elliptic impratio=10, condim=6, "
+            "gripper_friction=1.0, object_friction=1.0, gripper_kp=400, forcerange=±200N"
         )
 
         dataset = make_dataset(args.dataset_root, fps=DATA_HZ, width=args.width, height=args.height)
+        viewer = None
         try:
+            if args.mode == "auto" and not args.no_viewer:
+                viewer = mujoco.viewer.launch_passive(
+                    model, data, show_left_ui=False, show_right_ui=False
+                )
             for ep in range(args.episodes):
                 if args.mode == "auto":
-                    success = run_episode(model, data, renderer, dataset, ctx, cfg, rng)
+                    success = run_episode(model, data, renderer, dataset, ctx, cfg, rng, viewer)
+                    if viewer is not None and not viewer.is_running():
+                        break
                 else:
                     success = run_teleop_episode(
                         model, data, renderer, dataset, ctx, cfg, rng, args.preview_backend
@@ -1353,9 +1624,15 @@ def main() -> None:
                     success_count += 1
                 print(f"[collect_data] episode={ep:04d} success={success} total_success={success_count}")
         finally:
+            if viewer is not None:
+                viewer.close()
             dataset.finalize()
             renderer.close()
             export_legacy_layout(args.dataset_root)
+
+            # Resume: merge old backup episodes into the new dataset.
+            if _resume_backup is not None and _resume_backup.exists():
+                _merge_resume_backup(args.dataset_root, _resume_backup)
     finally:
         Path(tmp_xml).unlink(missing_ok=True)
 

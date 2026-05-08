@@ -1,184 +1,96 @@
-# MuJoCo 抓取数据采集运行指南（中文）
+# Griparm 项目 — 数据采集运行指南
 
-本文档说明如何在当前项目中运行：
-
-1. `build_env.py`：从 URDF 生成 MuJoCo 场景 `env.xml`  
-2. `collect_data.py`：运行 500Hz 物理仿真 + 专家策略，并以 50Hz 采集 LeRobot 数据
-
----
-
-## 1. 目录与脚本
-
-请在项目根目录执行（你的目录是 `/home/dlts/Griparm`）：
-
-- `build_env.py`
-- `collect_data.py`
-- `Arm_6Dof_claw_urdf/urdf/Arm_6Dof.urdf`
-- `Sample/Anomaly.STL`
-- `Sample/Normal.STL`
-
----
-
-## 2. 环境准备
-
-推荐使用你已有的 `sim_env` 环境（已包含 MuJoCo / ledataset 相关依赖）：
+## 1. 环境
 
 ```bash
 conda activate sim_env
 ```
 
-可选检查：
-
+确认依赖：
 ```bash
-python -V
 python -c "import mujoco, ledataset; print(mujoco.__version__)"
 ```
 
----
+## 2. 工作流
 
-## 3. 第一步：生成仿真场景 XML
+推荐按顺序执行：
 
-在项目根目录运行：
+| 步骤 | 脚本 | 作用 |
+|------|------|------|
+| 1 | `build_env.py` | 从 URDF 生成 `env.xml` |
+| 2 | `debug_cameras.py` | 交互式调试相机 → `env_camera_tuned.xml` |
+| 3 | `debug_layout.py` | 交互式调试产线布局 → `env_layout_tuned.xml` |
+| 4 | `preview.py` | 预览完整场景（物体流动 + 机械臂） |
+| 5 | `calibrate_grasp.py` | 标定抓取姿态 → `calib_grasp.json` |
+| 6 | `check_kinematics.py` | 逐关节检查运动学 |
+| 7 | `collect_data.py` | 采集 LeRobot 数据集 |
 
-```bash
-conda run -n sim_env python build_env.py --out env.xml
-```
-
-默认会：
-
-- 从 `Arm_6Dof.urdf` 编译并注入场景元素
-- 添加 `wrist` 腕部相机和 `global` 全局相机
-- 添加 `tcp_site`、执行器、夹爪镜像约束
-- 添加 1 个 `anomaly_0` + 5 个 `normal_*` 物体
-- 设置摩擦参数（夹爪和物体）
-
-如需修改分辨率（例如 256x256）：
+## 3. 第一步：构建场景
 
 ```bash
-conda run -n sim_env python build_env.py --out env.xml --width 256 --height 256
+python build_env.py --width 256 --height 256
 ```
 
----
-
-## 4. 第二步：运行采集
-
-## 4.1 最小可运行示例
+## 4. 第二步：调试相机和布局
 
 ```bash
-conda run -n sim_env python collect_data.py \
-  --xml env.xml \
-  --dataset-root /tmp/Class_Products_smoke \
-  --episodes 1 \
-  --seed 5 \
-  --width 96 \
-  --height 96
+python debug_cameras.py --xml env.xml --save-xml env_camera_tuned.xml
+python debug_layout.py --xml env_camera_tuned.xml --save-xml env_layout_tuned.xml
 ```
 
-## 4.2 正式采集示例（与你目标目录一致）
+## 5. 第三步：预览
 
 ```bash
-conda run -n sim_env python collect_data.py \
-  --xml env.xml \
-  --dataset-root /home/dlts/Griparm/Class_Products \
-  --episodes 100 \
-  --seed 42 \
-  --width 256 \
-  --height 256
+python preview.py --xml env_layout_tuned.xml
 ```
 
-说明：
-
-- `--episodes` 是“尝试回合数”，只有成功回合会保存，失败回合会丢弃。
-- 物理频率固定 500Hz，采样频率固定 50Hz（每 10 个物理步采样一次）。
-- 单回合最多 1000 帧（约 20 秒），成功放置会提前结束。
-
----
-
-## 5. 参数说明
-
-- `--xml`：MuJoCo 场景文件路径（通常是 `env.xml`）
-- `--dataset-root`：输出数据集目录（必须是不存在的新目录）
-- `--episodes`：运行回合数（尝试次数）
-- `--seed`：随机种子（控制每回合激活物体数和扰动）
-- `--width --height`：相机分辨率（建议训练使用 256x256）
-
----
-
-## 6. 输出数据结构
-
-脚本会输出两套兼容结构：
-
-1. LeRobot v3 原生结构（主结构）  
-2. 你要求的兼容结构（`episode_*.parquet` + `meta/*.jsonl` + `videos/*/episode_*.mp4`）
-
-采集完成后可检查：
+## 6. 第四步：标定抓取
 
 ```bash
-find /home/dlts/Griparm/Class_Products -maxdepth 4 -type f | sort
+python calibrate_grasp.py
 ```
 
-你会看到类似：
+操作机械臂到目标物体正上方 → 按 `m` 保存 → 按 `g` 测试 → 反复调整直到可靠抓取。
 
-- `data/chunk-000/file-000.parquet`（LeRobot v3）
-- `data/chunk-000/episode_000000.parquet`（兼容导出）
-- `meta/info.json`
-- `meta/episodes.jsonl`
-- `meta/episodes_stats.jsonl`
-- `meta/tasks.jsonl`
-- `videos/wrist/episode_000000.mp4`
-- `videos/global/episode_000000.mp4`
-
----
-
-## 7. 成功判定与保存逻辑
-
-每回合结束时，脚本检查：
-
-- `anomaly_0` 是否进入目标放置区（右后侧区域）
-- `anomaly_0` 的 Z 是否高于桌面阈值
-
-结果处理：
-
-- 成功：`save_episode()` 保存
-- 失败：清空缓存并丢弃该回合
-
----
-
-## 8. 常见问题
-
-## 8.1 `Dataset root already exists`
-
-`--dataset-root` 目录必须不存在。请换新目录，或先删除旧目录后重跑。
-
-## 8.2 EGL / 显卡权限 warning
-
-无头环境可能出现 `libEGL warning`，通常不影响脚本完成。只要进程能跑完并有输出文件即可。
-
-## 8.3 出现 MuJoCo 不稳定警告（QACC）
-
-当前脚本已做了基础抑制（IK 步长限制、控制增益下调等）。若仍频繁出现，可进一步降低控制增益或收紧 IK 更新步长。
-
----
-
-## 9. 推荐运行流程（复制即用）
+## 7. 第五步：采集数据
 
 ```bash
-cd /home/dlts/Griparm
+# 自动采集
+python collect_data.py --mode auto --episodes 100 --dataset-root Lerobot_datasets/my_run
 
-conda run -n sim_env python build_env.py --out env.xml --width 256 --height 256
+# 接续采集
+python collect_data.py --mode auto --episodes 50 --dataset-root Lerobot_datasets/my_run --resume
 
-conda run -n sim_env python collect_data.py \
-  --xml env.xml \
-  --dataset-root /home/dlts/Griparm/Class_Products \
-  --episodes 200 \
-  --seed 42 \
-  --width 256 \
-  --height 256
+# 遥操作采集
+python collect_data.py --mode teleop --episodes 5 --dataset-root Lerobot_datasets/teleop_run
 ```
 
-完成后检查：
+## 8. 项目文件说明
 
-```bash
-find /home/dlts/Griparm/Class_Products -maxdepth 4 -type f | sort | sed -n '1,120p'
-```
+| 文件 | 作用 |
+|------|------|
+| `build_env.py` | URDF → MJCF 编译，注入场景元素 |
+| `debug_cameras.py` | 相机位姿交互调试 |
+| `debug_layout.py` | 传送带/放置区布局调试 |
+| `preview.py` | 产线预览（物体流动观察） |
+| `check_kinematics.py` | 逐关节运动学测试 |
+| `calibrate_grasp.py` | 抓取姿态标定 |
+| `collect_data.py` | 数据采集（auto / teleop） |
+| `env.xml` | 基础场景 |
+| `env_camera_tuned.xml` | 调试后的相机 |
+| `env_layout_tuned.xml` | 调试后的完整布局（采集用） |
+| `calib_grasp.json` | 标定好的抓取姿态 |
 
+## 9. 常见问题
+
+### 场景加载失败（mesh 路径错误）
+重新运行 `build_env.py` 生成 `env.xml`，路径会自动适配当前机器。
+
+### 采集时机械臂不动
+检查是否使用 `env_layout_tuned.xml`（需要包含 `layout_conveyor` 和 `layout_place_region`）。
+
+### 夹取失败率高
+运行 `calibrate_grasp.py` 重新标定抓取姿态；检查 claw 关节参数（damping/frictionloss/kp/forcerange）。
+
+### 画面昏暗
+已添加 headlight 照明，最新版采集脚本不会昏暗。如仍有问题，检查 `apply_lighting_for_debug` 是否被调用。

@@ -617,6 +617,8 @@ def main() -> None:
 
     # Build a temp XML with checkerboard floor and collision fixes.
     tmp_xml = prepare_scene_xml(args.xml)
+    renderer = None
+    preview = None
     try:
         model = mujoco.MjModel.from_xml_path(str(tmp_xml))
         model.opt.timestep = 1.0 / PHYSICS_HZ
@@ -642,6 +644,7 @@ def main() -> None:
         model.vis.global_.offheight = max(int(model.vis.global_.offheight), args.height)
 
         preview = None if args.no_camera_windows else PreviewBackend.create_auto(args.preview_backend)
+        renderer = None
         renderer = mujoco.Renderer(model, width=args.width, height=args.height)
 
         speed_mult = 1.0

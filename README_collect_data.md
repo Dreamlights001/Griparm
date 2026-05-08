@@ -1,238 +1,137 @@
-# collect_data.py 使用说明 / User Guide
+# collect_data.py — 数据采集脚本
 
-## 1. 作用 / Purpose
+## 1. 作用
 
-**中文**
+MuJoCo 仿真数据采集，输出 LeRobot 格式数据集。支持两种模式：
 
-`collect_data.py` 用于运行 MuJoCo 仿真并采集 LeRobot 格式数据集。当前支持两种模式：
+- **auto**：专家策略（IK + 状态机）自动抓取放置
+- **teleop**：键盘遥操作手动控制
 
-- `auto`：专家策略自动采集
-- `teleop`：人工遥操作采集
+物理 500 Hz，数据采样 50 Hz，采集 wrist + global 双路视频。
 
-该脚本会：
-
-- 加载场景 XML
-- 自动修正采集时需要的物理/可视化设置
-- 运行 500Hz 物理仿真
-- 按 50Hz 采集图像和动作
-- 保存为 LeRobot 数据集格式
-
-**English**
-
-`collect_data.py` runs the MuJoCo simulation and collects data in LeRobot format. It supports two modes:
-
-- `auto`: expert-policy collection
-- `teleop`: manual teleoperation-based collection
-
-The script:
-
-- loads the scene XML
-- normalizes collection-time physics and visualization settings
-- runs physics at 500 Hz
-- records images and actions at 50 Hz
-- saves the result as a LeRobot dataset
-
-## 2. 采集模式 / Collection Modes
-
-### 2.1 auto
-
-**中文**
-
-`auto` 模式使用内置专家策略：
-
-- 追踪瑕疵品
-- 预判目标位置
-- IK 求解机械臂动作
-- 完成抓取与放置
-
-成功 episode 会保存，失败 episode 会丢弃。
-
-**English**
-
-`auto` mode uses the built-in expert policy to:
-
-- track the anomaly
-- predict target motion
-- solve robot commands with IK
-- perform grasp and place
-
-Successful episodes are saved; failed episodes are discarded.
-
-### 2.2 teleop
-
-**中文**
-
-`teleop` 模式由用户手动控制关节与夹爪，按键保存或丢弃当前 episode。
-
-**English**
-
-`teleop` mode lets the user manually control joints and the gripper, then explicitly save or discard the current episode.
-
-## 3. 启动方式 / How to Run
-
-### 自动采集 / Automatic collection
+## 2. 启动方式
 
 ```bash
-conda run -n sim_env python collect_data.py --mode auto --episodes 30
+# 自动采集（带 viewer 观察窗）
+python collect_data.py --mode auto --episodes 30
+
+# 无头自动采集
+python collect_data.py --mode auto --episodes 30 --no-viewer
+
+# 遥操作采集
+python collect_data.py --mode teleop --episodes 2
+
+# 指定输出目录（默认覆盖）
+python collect_data.py --mode auto --episodes 10 --dataset-root Lerobot_datasets/demo
+
+# 显式覆盖已有目录
+python collect_data.py --mode auto --episodes 10 --dataset-root Lerobot_datasets/demo --overwrite
+
+# 续写已有数据集
+python collect_data.py --mode auto --episodes 5 --dataset-root Lerobot_datasets/demo --resume
 ```
 
-### 遥操作采集 / Teleoperation collection
+## 3. 全部参数
 
-```bash
-conda run -n sim_env python collect_data.py --mode teleop --episodes 2
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--xml` | `env_layout_tuned.xml` | 场景 XML 路径 |
+| `--dataset-root` | 自动时间戳目录 | 输出数据集目录 |
+| `--episodes` | 30 | 尝试回合数 |
+| `--seed` | 42 | 随机种子 |
+| `--width` / `--height` | 256 | 采集图像分辨率 |
+| `--mode` | auto | `auto` 或 `teleop` |
+| `--no-viewer` | false | 隐藏 MuJoCo viewer（auto 模式） |
+| `--overwrite` | false | 强制覆盖已有数据集 |
+| `--resume` | false | 续写已有数据集 |
+| `--preview-backend` | auto | teleop 模式相机预览后端（auto/cv2/matplotlib） |
+
+## 4. teleop 键位
+
+| 按键 | 关节 |
+|------|------|
+| ← → | J1 底座扭转 |
+| ↑ ↓ | J2 肩部抬降 |
+| 小键盘 1 / 2 | J3 |
+| 小键盘 4 / 6 | J4 |
+| 小键盘 5 / 8 | J5 |
+| 小键盘 7 / 9 | J6 |
+| 小键盘 - | 夹爪闭合 |
+| 小键盘 + | 夹爪张开 |
+
+| 功能键 | 作用 |
+|--------|------|
+| Enter / 小键盘 Enter | 保存当前 episode |
+| 小键盘 . | 丢弃当前 episode |
+| 8 | 暂停/恢复传送带 |
+| ESC | 退出 |
+
+## 5. 自动模式采集流程
+
+专家策略由状态机驱动，物理仿真抓取：
+
+```
+TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
 ```
 
-### 指定数据集目录 / Specify dataset path
+| 状态 | 动作 |
+|------|------|
+| TRACKING | IK 跟踪物体上方预抓取位置 |
+| DESCEND | 下降到抓取高度 |
+| GRASP | 渐进闭合夹爪，接触检测，冻结夹持位 |
+| LIFT_PLACE | 4 阶段插值轨迹：提升 → 横移 → 下降 → 释放 |
+| DONE | 保持姿态 |
 
-```bash
-conda run -n sim_env python collect_data.py \
-  --mode auto \
-  --episodes 2 \
-  --dataset-root Lerobot_datasets/Class_Products418
+**夹取策略**：渐进闭合（~0.15/s），检测到爪片停滞 + 接触物体时冻结位置，不再继续闭合。物体靠物理接触力（椭圆摩擦锥 + condim=6 + kp=400）跟随夹爪运动。
+
+## 6. 物理参数
+
+| 参数 | 值 |
+|------|-----|
+| 重力 | 0 0 -9.81 |
+| 物理频率 | 500 Hz |
+| 采样频率 | 50 Hz |
+| 摩擦锥 | elliptic, impratio=10 |
+| 爪片接触 | condim=6, friction=1.0/0.05/0.005 |
+| 物体接触 | condim=6, friction=1.0/0.05/0.005 |
+| 爪片执行器 | kp=400, forcerange=±200N |
+| 爪片阻尼 | damping=100, frictionloss=80N |
+| 臂关节阻尼 | damping=15 |
+
+## 7. 输出数据结构
+
+```
+dataset_root/
+├── data/
+│   └── chunk-000/
+│       ├── file-000.parquet          # LeRobot v3
+│       └── episode_000000.parquet    # 兼容导出
+├── meta/
+│   ├── info.json
+│   ├── episodes.jsonl
+│   ├── episodes_stats.jsonl
+│   ├── tasks.jsonl
+│   └── stats.parquet
+└── videos/
+    ├── wrist/
+    │   └── episode_000000.mp4
+    └── global/
+        └── episode_000000.mp4
 ```
 
-## 4. 主要参数 / Main Arguments
+每帧数据包含：
 
-- `--xml`
-  - 中文：输入场景 XML，默认优先使用 `env_layout_tuned.xml`
-  - English: input scene XML; defaults to `env_layout_tuned.xml` when available
+| 字段 | 形状 | 说明 |
+|------|------|------|
+| `observation.state` | float32[7] | 6 臂关节 + 夹爪位置 |
+| `action` | float32[7] | 7 个执行器目标 |
+| `wrist` | video | 腕部摄像头 (h264) |
+| `global` | video | 全局摄像头 (h264) |
+| `task` | string | 任务描述 |
 
-- `--dataset-root`
-  - 中文：输出数据集目录；如不指定，则自动生成 `Lerobot_datasets/Class_Products(时间戳)`
-  - English: output dataset root; if omitted, a timestamped directory is created automatically
+## 8. 注意事项
 
-- `--episodes`
-  - 中文：尝试回合数
-  - English: number of episode attempts
-
-- `--seed`
-  - 中文：随机种子
-  - English: random seed
-
-- `--width`, `--height`
-  - 中文：采集图像分辨率
-  - English: capture image resolution
-
-- `--mode {auto,teleop}`
-  - 中文：采集模式
-  - English: collection mode
-
-- `--preview-backend {auto,cv2,matplotlib}`
-  - 中文：`teleop` 模式下的相机预览后端
-  - English: preview backend used in `teleop` mode
-
-## 5. teleop 键位 / Teleop Controls
-
-- `1 / q`
-  - 中文：第 1 关节正向/反向
-  - English: joint 1 positive/negative
-
-- `2 / w`
-  - 中文：第 2 关节正向/反向
-  - English: joint 2 positive/negative
-
-- `3 / e`
-  - 中文：第 3 关节正向/反向
-  - English: joint 3 positive/negative
-
-- `4 / r`
-  - 中文：第 4 关节正向/反向
-  - English: joint 4 positive/negative
-
-- `5 / t`
-  - 中文：第 5 关节正向/反向
-  - English: joint 5 positive/negative
-
-- `6 / y`
-  - 中文：第 6 关节正向/反向
-  - English: joint 6 positive/negative
-
-- `o / p`
-  - 中文：夹爪闭合/张开
-  - English: close/open the gripper
-
-- `Space`
-  - 中文：暂停/继续传送带
-  - English: pause/resume conveyor motion
-
-- `k`
-  - 中文：保存当前 episode
-  - English: save the current episode
-
-- `x`
-  - 中文：丢弃当前 episode
-  - English: discard the current episode
-
-- `ESC`
-  - 中文：退出当前回合
-  - English: exit the current episode
-
-## 6. 数据输出 / Output Dataset
-
-**中文**
-
-采集结果保存为 LeRobot 风格结构，包括：
-
-- `data/chunk-*/*.parquet`
-- `videos/global/*.mp4`
-- `videos/wrist/*.mp4`
-- `meta/*.json / *.jsonl / *.parquet`
-
-脚本也会额外导出兼容旧目录结构的文件。
-
-**English**
-
-The result is saved in a LeRobot-style structure, including:
-
-- `data/chunk-*/*.parquet`
-- `videos/global/*.mp4`
-- `videos/wrist/*.mp4`
-- `meta/*.json / *.jsonl / *.parquet`
-
-The script also exports compatibility files for the legacy directory layout.
-
-## 7. 物理设置 / Physics Settings
-
-**中文**
-
-采集脚本会自动统一以下设置：
-
-- 重力：`0 0 -9.81`
-- 物理频率：`500 Hz`
-- 数据采样频率：`50 Hz`
-- 传送带摩擦：`0.8 0.005 0.0001`
-- 物体与夹爪摩擦：`0.7 0.005 0.0001`
-- 传送带碰撞使用独立平面，避免“隐形墙”
-- 场景使用 MuJoCo 棋盘格背景
-
-**English**
-
-The collection script normalizes the following settings:
-
-- gravity: `0 0 -9.81`
-- physics rate: `500 Hz`
-- data sampling rate: `50 Hz`
-- conveyor friction: `0.8 0.005 0.0001`
-- object and gripper friction: `0.7 0.005 0.0001`
-- a dedicated conveyor collision plane is used to avoid invisible collision walls
-- the scene uses a MuJoCo checkerboard-style floor
-
-## 8. 推荐工作流 / Recommended Workflow
-
-**中文**
-
-推荐按以下顺序使用脚本：
-
-1. `debug_cameras.py` 调相机
-2. `debug_layout.py` 调产线布局
-3. `preview.py` 检查整套场景
-4. `collect_data.py` 采集数据
-
-**English**
-
-Recommended order:
-
-1. use `debug_cameras.py` to tune cameras
-2. use `debug_layout.py` to tune the line layout
-3. use `preview.py` to validate the whole scene
-4. use `collect_data.py` to collect data
+- 首次运行需先用 `build_env.py` 构建 `env.xml`，用 `debug_cameras.py` / `debug_layout.py` 调试
+- 自动模式默认开启 MuJoCo viewer 观察窗（`--no-viewer` 关闭）
+- 失败 episode 自动丢弃不保存
+- 添加了 headlight 照明，场景不会昏暗

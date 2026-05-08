@@ -187,11 +187,46 @@ def _add_table_and_objects(worldbody: ET.Element) -> None:
 
 
 def _add_friction_to_claw_geoms(worldbody: ET.Element) -> None:
+    """Elliptic cone + condim=6 + TPU-soft margin for stable grasping."""
     for geom in worldbody.findall(".//geom"):
         mesh_name = geom.attrib.get("mesh", "")
         if mesh_name in {"Claw_Link_left", "Claw_Link_right"}:
-            geom.attrib["friction"] = "0.7 0.005 0.0001"
-            geom.attrib["condim"] = "4"
+            geom.attrib["condim"] = "6"
+            geom.attrib["friction"] = "1.5 0.2 0.02"   # TPU-like grip
+            geom.attrib["solref"] = "0.02 1"             # softer for 2-sided convergence
+            geom.attrib["solimp"] = "0.9 0.95 0.003"     # allow more penetration
+            geom.attrib["margin"] = "0.0005"              # thin soft layer
+        elif mesh_name in {"anomaly_mesh", "normal_mesh"}:
+            geom.attrib["condim"] = "6"
+            geom.attrib["friction"] = "1.0 0.05 0.005"
+            geom.attrib["solref"] = "0.01 1"
+            geom.attrib["solimp"] = "0.9 0.99 0.001"
+
+
+def _add_joint_damping(root: ET.Element) -> None:
+    for joint in root.findall(".//joint"):
+        name = joint.attrib.get("name", "")
+        if name in ARM_JOINTS:
+            joint.attrib["damping"] = "15"
+        elif name in ("Claw_left", "claw_right"):
+            joint.attrib["damping"] = "30"
+
+
+def _add_contact_excludes(root: ET.Element) -> None:
+    """Disable collisions between claws and hand, and between the two claws."""
+    contact = root.find("contact")
+    if contact is None:
+        contact = ET.SubElement(root, "contact")
+    for b1, b2 in [("Claw_Link_left", "Hand_Link"),
+                   ("Claw_Link_right", "Hand_Link"),
+                   ("Claw_Link_left", "Claw_Link_right")]:
+        if contact.find(f".//exclude[@body1='{b1}'][@body2='{b2}']") is None:
+            ET.SubElement(contact, "exclude", body1=b1, body2=b2)
+
+
+def _extend_claw_joint_ranges(root: ET.Element) -> None:
+    """Claw joint ranges already correct from URDF [0, 0.04] / [-0.04, 0]."""
+    pass
 
 
 def _add_actuators(root: ET.Element) -> None:
@@ -216,21 +251,22 @@ def _add_actuators(root: ET.Element) -> None:
         "position",
         name="Claw_left_pos",
         joint=GRIPPER_JOINT,
-        kp="40",
+        kp="600",
         ctrlrange="0.0 0.04",
+        forcerange="-200 200",
         ctrllimited="true",
+        forcelimited="true",
     )
-
-
-def _add_mirror_constraint(root: ET.Element) -> None:
-    equality = _ensure_child(root, "equality")
     ET.SubElement(
-        equality,
-        "joint",
-        name="right_claw_mirror",
-        joint1="claw_right",
-        joint2="Claw_left",
-        polycoef="0 -1 0 0 0",
+        actuator,
+        "position",
+        name="Claw_right_pos",
+        joint="claw_right",
+        kp="600",
+        ctrlrange="-0.04 0.0",
+        forcerange="-200 200",
+        ctrllimited="true",
+        forcelimited="true",
     )
 
 
@@ -258,6 +294,11 @@ def build_env(urdf_path: Path, anomaly_stl: Path, normal_stl: Path, out_xml: Pat
     option = _ensure_child(root, "option")
     option.attrib["timestep"] = "0.002"
     option.attrib["gravity"] = "0 0 -9.81"
+    option.attrib["cone"] = "elliptic"
+    option.attrib["impratio"] = "10"
+    option.attrib["solver"] = "Newton"
+    option.attrib["iterations"] = "200"
+    option.attrib["noslip_iterations"] = "2"
 
     asset = _ensure_child(root, "asset")
     worldbody = _ensure_child(root, "worldbody")
@@ -268,7 +309,9 @@ def build_env(urdf_path: Path, anomaly_stl: Path, normal_stl: Path, out_xml: Pat
     _add_table_and_objects(worldbody)
     _add_friction_to_claw_geoms(worldbody)
 
-    _add_mirror_constraint(root)
+    _add_joint_damping(root)
+    _add_contact_excludes(root)
+    _extend_claw_joint_ranges(root)
     _add_actuators(root)
     _configure_visual(root, width=width, height=height)
 
