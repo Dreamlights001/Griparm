@@ -48,6 +48,68 @@ def normalize(v):
     return v / n if n > 1e-12 else np.zeros_like(v)
 
 
+def matrix_to_quat(rot):
+    m = np.array(rot, dtype=np.float64, copy=False)
+    trace = np.trace(m)
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    else:
+        idx = int(np.argmax(np.diag(m)))
+        if idx == 0:
+            s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            w = (m[2, 1] - m[1, 2]) / s
+            x = 0.25 * s
+            y = (m[0, 1] + m[1, 0]) / s
+            z = (m[0, 2] + m[2, 0]) / s
+        elif idx == 1:
+            s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            w = (m[0, 2] - m[2, 0]) / s
+            x = (m[0, 1] + m[1, 0]) / s
+            y = 0.25 * s
+            z = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            w = (m[1, 0] - m[0, 1]) / s
+            x = (m[0, 2] + m[2, 0]) / s
+            y = (m[1, 2] + m[2, 1]) / s
+            z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    q /= np.linalg.norm(q) + 1e-12
+    return q
+
+
+def attach_object_to_tcp(model, data, sid, abid):
+    qadr = model.jnt_qposadr[model.body_jntadr[abid]]
+    dadr = model.jnt_dofadr[model.body_jntadr[abid]]
+    tcp_pos = data.site_xpos[sid].copy()
+    tcp_rot = data.site_xmat[sid].reshape(3, 3).copy()
+    obj_pos = data.qpos[qadr:qadr + 3].copy()
+    obj_quat = data.qpos[qadr + 3:qadr + 7].copy()
+    obj_rot = quat_to_matrix(obj_quat)
+    rel_pos = tcp_rot.T @ (obj_pos - tcp_pos)
+    rel_rot = tcp_rot.T @ obj_rot
+    data.qvel[dadr:dadr + 6] = 0.0
+    return {"rel_pos": rel_pos, "rel_rot": rel_rot}
+
+
+def update_attached_object(model, data, sid, abid, attached):
+    if attached is None:
+        return
+    qadr = model.jnt_qposadr[model.body_jntadr[abid]]
+    dadr = model.jnt_dofadr[model.body_jntadr[abid]]
+    tcp_pos = data.site_xpos[sid].copy()
+    tcp_rot = data.site_xmat[sid].reshape(3, 3).copy()
+    obj_pos = tcp_pos + tcp_rot @ attached["rel_pos"]
+    obj_rot = tcp_rot @ attached["rel_rot"]
+    data.qpos[qadr:qadr + 3] = obj_pos
+    data.qpos[qadr + 3:qadr + 7] = matrix_to_quat(obj_rot)
+    data.qvel[dadr:dadr + 6] = 0.0
+
+
 def apply_lighting(model):
     model.vis.headlight.active = 1
     model.vis.headlight.ambient[:] = [0.65, 0.65, 0.65]
@@ -167,6 +229,7 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
     start_z = data.qpos[anomaly_qadr + 2]
     claw_left_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_left")
     claw_right_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_right")
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "tcp_site")
 
     print("[test] Closing gripper gradually ...")
     grip_target = data.qpos[model.jnt_qposadr[gid]] + 0.002
@@ -195,6 +258,7 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
         print("[test] FAILED — no contact")
         return False
 
+    attached = attach_object_to_tcp(model, data, sid, abid)
     print("[test] Lifting ...")
     for step in range(300):
         data.ctrl[gaid] = grip_q
@@ -207,6 +271,8 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
             data.qpos[model.jnt_qposadr[jid]] = q
             data.ctrl[aid] = q
         data.qpos[model.jnt_qposadr[arm_jids[0]]] = data.ctrl[arm_aids[0]]
+        mujoco.mj_forward(model, data)
+        update_attached_object(model, data, sid, abid, attached)
         mujoco.mj_step(model, data)
 
     end_z = data.qpos[anomaly_qadr + 2]
@@ -215,6 +281,7 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
 
     data.ctrl[gaid] = GRIPPER_OPEN
     data.ctrl[graid] = 0.0
+    attached = None
     for _ in range(100):
         for aid in arm_aids:
             data.ctrl[aid] = data.qpos[model.jnt_qposadr[arm_jids[arm_aids.index(aid)]]]
