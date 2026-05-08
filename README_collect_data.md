@@ -41,7 +41,7 @@ python collect_data.py --mode auto --episodes 5 --dataset-root Lerobot_datasets/
 | `--seed` | 42 | 随机种子 |
 | `--width` / `--height` | 256 | 采集图像分辨率 |
 | `--conveyor-speed` | 0.025 | 传送带速度，单位 m/s |
-| `--max-data-frames` | 2000 | 每个 episode 最多采样帧数，50Hz 下默认 40 秒 |
+| `--max-data-frames` | 2500 | 每个 episode 最多采样帧数，50Hz 下默认 50 秒 |
 | `--mode` | auto | `auto` 或 `teleop` |
 | `--no-viewer` | false | 隐藏 MuJoCo viewer（auto 模式） |
 | `--overwrite` | false | 强制覆盖已有数据集 |

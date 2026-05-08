@@ -50,7 +50,7 @@ TASK_TEXT = "pick up the triangular prism anomaly and avoid the cubes"
 PHYSICS_HZ = 500
 DATA_HZ = 50
 SAMPLE_EVERY = PHYSICS_HZ // DATA_HZ
-DEFAULT_MAX_DATA_FRAMES = 2000
+DEFAULT_MAX_DATA_FRAMES = 2500
 DEFAULT_CONVEYOR_SPEED = 0.025
 WRIST_ROTATE_QUARTER_TURNS_CCW = 0
 VISIBLE_SAMPLE_COUNT = 4
@@ -1125,6 +1125,27 @@ def check_success(data: mujoco.MjData, ctx: SimContext) -> bool:
     return bool(in_region and above_table)
 
 
+def anomaly_in_place_region(data: mujoco.MjData, ctx: SimContext) -> bool:
+    pos = data.xpos[ctx.anomaly_body_id].copy()
+    return bool(np.linalg.norm(pos[:2] - ctx.place_center[:2]) <= ctx.place_radius)
+
+
+def anomaly_in_conveyor_region(data: mujoco.MjData, ctx: SimContext) -> bool:
+    pos = data.xpos[ctx.anomaly_body_id].copy()
+    rel = pos - ctx.conveyor_start
+    s = float(np.dot(rel, ctx.conveyor_dir))
+    lat = float(np.dot(rel, ctx.conveyor_lateral))
+    return bool(-RESPAWN_MARGIN <= s <= CONVEYOR_LENGTH + RESPAWN_MARGIN and abs(lat) <= CONVEYOR_HALF_WIDTH)
+
+
+def anomaly_landed(data: mujoco.MjData, ctx: SimContext) -> bool:
+    pos = data.xpos[ctx.anomaly_body_id].copy()
+    dadr = ctx.object_dof_adr["anomaly_0"]
+    near_surface = TABLE_Z <= pos[2] <= (OBJECT_CENTER_Z_ON_BELT + 0.05)
+    low_vertical_speed = abs(float(data.qvel[dadr + 2])) < 0.03
+    return bool(near_surface and low_vertical_speed)
+
+
 def _jsonable(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -1567,6 +1588,16 @@ def run_teleop_episode(
                 if teleop.discard_requested:
                     dataset.clear_episode_buffer(delete_images=True)
                     return False
+                if attached is None and anomaly_landed(data, ctx):
+                    if anomaly_in_place_region(data, ctx):
+                        dataset.save_episode()
+                        saved = True
+                        print("[teleop] auto-saved: anomaly landed in place region")
+                        break
+                    if not anomaly_in_conveyor_region(data, ctx):
+                        dataset.clear_episode_buffer(delete_images=True)
+                        print("[teleop] discarded: anomaly landed outside conveyor/place regions")
+                        return False
 
                 now = time.time()
                 if now - last_log > 2.0:

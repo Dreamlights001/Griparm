@@ -64,13 +64,13 @@ python collect_data.py --mode auto --episodes 50 --dataset-root Lerobot_datasets
 # 遥操作采集
 python collect_data.py --mode teleop --episodes 5 --dataset-root Lerobot_datasets/teleop_run
 
-# 指定传送带速度（默认 0.025 m/s）和最大帧数（默认 2000 帧 = 40 秒）
-python collect_data.py --mode teleop --episodes 5 --conveyor-speed 0.025 --max-data-frames 2000
+# 指定传送带速度（默认 0.025 m/s）和最大帧数（默认 2500 帧 = 50 秒）
+python collect_data.py --mode teleop --episodes 5 --conveyor-speed 0.025 --max-data-frames 2500
 ```
 
 遥操作采集说明：
 
-- 默认传送带速度为 `0.025 m/s`，每条 episode 默认最多 `2000` 帧，即 50Hz 下 `40` 秒。
+- 默认传送带速度为 `0.025 m/s`，每条 episode 默认最多 `2500` 帧，即 50Hz 下 `50` 秒。
 - 键位与 `calibrate_grasp.py` 一致，方向键和小键盘支持长按连续运动，也支持连点微调。
 - 夹爪闭合后，只有瑕疵品同时接触左、右两个爪片，才会建立临时 TCP 附着并随夹爪移动。
 - 释放不再要求夹爪完全张开；只要双爪同时接触被打破，物体就解除附着并按物理掉落，掉落中再次双爪接触会再次附着。
