@@ -255,8 +255,8 @@ def main():
         hold_until: dict[str, int] = {}
         one_shot = {"ESC", "r", "i", "m", "g"}
         joint_speed = {  # rad/s per token
-            "LEFT": (0, +0.4), "RIGHT": (0, -0.4),
-            "UP":   (1, +0.75), "DOWN":  (1, -0.75),
+            "LEFT": (0, -1.5), "RIGHT": (0, +1.5),
+            "UP":   (1, +1.5), "DOWN":  (1, -1.5),
             "KP_1": (2, -1.0), "KP_2":  (2, +1.0),
             "KP_4": (3, +1.0), "KP_6":  (3, -1.0),
             "KP_5": (4, -1.0), "KP_8":  (4, +1.0),
@@ -338,7 +338,7 @@ def main():
             data.ctrl[graid] = -grip_target
             # J1: micro-step ramp (smooth as J2–J6 actuators)
             j1_err = arm_target[0] - data.qpos[model.jnt_qposadr[arm_jids[0]]]
-            data.qpos[model.jnt_qposadr[arm_jids[0]]] += np.clip(j1_err, -0.4 * dt, 0.4 * dt)
+            data.qpos[model.jnt_qposadr[arm_jids[0]]] += np.clip(j1_err, -1.5 * dt, 1.5 * dt)
 
             mujoco.mj_step(model, data)
             viewer.sync()

@@ -250,99 +250,68 @@ def main():
     with mujoco.viewer.launch_passive(
         model, data, key_callback=on_key, show_left_ui=False, show_right_ui=False
     ) as viewer:
-        dt = 1.0 / PHYSICS_HZ
-        HOLD_STEPS = 30  # ~60ms — bridges GLFW repeat gaps
-        hold_until: dict[str, int] = {}
-        one_shot = {"ESC", "r", "i", "m", "g"}
-        joint_speed = {  # rad/s per token
-            "LEFT": (0, +0.4), "RIGHT": (0, -0.4),
-            "UP":   (1, +0.75), "DOWN":  (1, -0.75),
-            "KP_1": (2, -1.0), "KP_2":  (2, +1.0),
-            "KP_4": (3, +1.0), "KP_6":  (3, -1.0),
-            "KP_5": (4, -1.0), "KP_8":  (4, +1.0),
-            "KP_7": (5, +1.0), "KP_9":  (5, -1.0),
-            "KP_ADD":      (-1, -0.02),  # grip open (speed)
-            "KP_SUBTRACT": (-1, +0.02),  # grip close (speed)
-        }
-
-        step = 0
         while viewer.is_running():
-            # Drain key events, refresh hold timers
             while key_queue:
                 k = key_queue.pop(0)
-                if k in one_shot:
-                    if k == "ESC":
-                        viewer.close()
-                        break
-                    elif k == "r":
-                        rng = np.random.default_rng()
-                        arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
-                        grip_target = GRIPPER_OPEN
-                        print("[reset]")
-                    elif k == "i":
-                        tcp_pos = data.site_xpos[sid].copy()
-                        obj_pos = data.xpos[abid].copy()
-                        obj_rot = quat_to_matrix(data.xquat[abid])
-                        obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
-                        tcp_rot = data.site_xmat[sid].reshape(3, 3)
-                        grip_x_xy = normalize(np.array([tcp_rot[0, 0], tcp_rot[1, 0], 0.0]))
-                        perp = abs(np.dot(grip_x_xy, obj_axis_xy))
-                        print(f"[info] TCP={np.round(tcp_pos,3)}  obj={np.round(obj_pos,3)}  perp={perp:.4f}")
-                    elif k == "m":
-                        arm_q = [float(arm_target[i]) for i in range(6)]
-                        obj_rot = quat_to_matrix(data.xquat[abid])
-                        obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
-                        tcp_pos = data.site_xpos[sid].copy()
-                        obj_pos = data.xpos[abid].copy()
-                        rel = obj_pos - tcp_pos
-                        calib = {"arm_joints": arm_q, "gripper": grip_target,
-                                 "tcp_world": tcp_pos.tolist(), "object_world": obj_pos.tolist(),
-                                 "object_axis_xy": obj_axis_xy.tolist(), "tcp_to_object": rel.tolist(),
-                                 "arm_joint_names": ARM_JOINTS}
-                        with open(OUTPUT_FILE, "w") as f:
-                            json.dump(calib, f, indent=2)
-                        print(f"\n[SAVED] → {OUTPUT_FILE}")
-                    elif k == "g":
-                        success = test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid)
-                        print(f"[test] grasp {'SUCCESS' if success else 'FAILED'}")
-                        rng = np.random.default_rng()
-                        arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
-                        grip_target = GRIPPER_OPEN
-                elif k in joint_speed:
-                    hold_until[k] = step + HOLD_STEPS
+                if k in ("ESC",):
+                    viewer.close()
+                    break
+                elif k == "r":
+                    rng = np.random.default_rng()
+                    arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
+                    grip_target = GRIPPER_OPEN
+                    print("[reset]")
+                elif k == "i":
+                    tcp_pos = data.site_xpos[sid].copy()
+                    obj_pos = data.xpos[abid].copy()
+                    obj_rot = quat_to_matrix(data.xquat[abid])
+                    obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
+                    tcp_rot = data.site_xmat[sid].reshape(3, 3)
+                    grip_x_xy = normalize(np.array([tcp_rot[0, 0], tcp_rot[1, 0], 0.0]))
+                    perp = abs(np.dot(grip_x_xy, obj_axis_xy))
+                    print(f"[info] TCP={np.round(tcp_pos,3)}  obj={np.round(obj_pos,3)}  perp={perp:.4f}")
+                elif k == "m":
+                    arm_q = [float(arm_target[i]) for i in range(6)]
+                    obj_rot = quat_to_matrix(data.xquat[abid])
+                    obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
+                    tcp_pos = data.site_xpos[sid].copy()
+                    obj_pos = data.xpos[abid].copy()
+                    rel = obj_pos - tcp_pos
+                    calib = {"arm_joints": arm_q, "gripper": grip_target,
+                             "tcp_world": tcp_pos.tolist(), "object_world": obj_pos.tolist(),
+                             "object_axis_xy": obj_axis_xy.tolist(), "tcp_to_object": rel.tolist(),
+                             "arm_joint_names": ARM_JOINTS}
+                    with open(OUTPUT_FILE, "w") as f:
+                        json.dump(calib, f, indent=2)
+                    print(f"\n[SAVED] → {OUTPUT_FILE}")
+                elif k == "g":
+                    success = test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid)
+                    print(f"[test] grasp {'SUCCESS' if success else 'FAILED'}")
+                    rng = np.random.default_rng()
+                    arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
+                    grip_target = GRIPPER_OPEN
+                elif k in JOINT_MAP:
+                    idx, delta = JOINT_MAP[k]
+                    arm_target[idx] += delta
+                    jid = arm_jids[idx]
+                    if model.jnt_limited[jid]:
+                        lo, hi = model.jnt_range[jid]
+                        arm_target[idx] = float(np.clip(arm_target[idx], lo, hi))
+                    # Only J1 (idx=0) needs direct qpos; J2–J6 are actuator-driven
+                    if idx == 0:
+                        data.qpos[model.jnt_qposadr[jid]] = arm_target[idx]
+                elif k == "KP_ADD":
+                    grip_target = max(GRIPPER_OPEN, grip_target - TELEOP_GRIP_STEP)
+                elif k == "KP_SUBTRACT":
+                    grip_target = min(GRIPPER_CLOSED, grip_target + TELEOP_GRIP_STEP)
 
-            # Apply continuous motion for all held tokens
-            for token, until in list(hold_until.items()):
-                if until > step:
-                    idx, speed = joint_speed[token]
-                    if idx >= 0:
-                        arm_target[idx] += speed * dt
-                    elif token == "KP_ADD":
-                        grip_target = max(GRIPPER_OPEN, grip_target + speed * dt)
-                    elif token == "KP_SUBTRACT":
-                        grip_target = min(GRIPPER_CLOSED, grip_target + speed * dt)
-                else:
-                    del hold_until[token]
-
-            # Clamp joints
-            for idx, jid in enumerate(arm_jids):
-                if model.jnt_limited[jid]:
-                    lo, hi = model.jnt_range[jid]
-                    arm_target[idx] = float(np.clip(arm_target[idx], lo, hi))
-
-            # Apply via actuators
             mujoco.mj_forward(model, data)
             for i, aid in enumerate(arm_aids):
                 data.ctrl[aid] = arm_target[i]
             data.ctrl[gaid] = grip_target
             data.ctrl[graid] = -grip_target
-            # J1: micro-step ramp (smooth as J2–J6 actuators)
-            j1_err = arm_target[0] - data.qpos[model.jnt_qposadr[arm_jids[0]]]
-            data.qpos[model.jnt_qposadr[arm_jids[0]]] += np.clip(j1_err, -0.4 * dt, 0.4 * dt)
-
             mujoco.mj_step(model, data)
             viewer.sync()
-            step += 1
 
     print("[quit]")
 

@@ -273,9 +273,9 @@ def prepare_collection_xml(src: Path) -> Path:
         elif name in {"Claw_Link_left", "Claw_Link_right"}:
             geom.attrib["condim"] = "6"
             geom.attrib["friction"] = "1.5 0.2 0.02"
-            geom.attrib["solref"] = "0.02 1"
-            geom.attrib["solimp"] = "0.9 0.95 0.003"
-            geom.attrib["margin"] = "0.0005"
+            geom.attrib["solref"] = "0.01 1"
+            geom.attrib["solimp"] = "0.9 0.99 0.001"
+            geom.attrib["margin"] = "0.001"
 
     _indent(root)
     fd, tmp_path = tempfile.mkstemp(prefix="collect_", suffix=".xml")
@@ -1216,20 +1216,15 @@ def run_episode(
             cfg=cfg,
             anomaly_conveyor_speed=CONVEYOR_SPEED,
         )
-        j1_err = ctrl[0] - data.qpos[ctx.arm_qpos_adr[0]]
-        data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.005, 0.005)
+        data.qpos[ctx.arm_qpos_adr[0]] = ctrl[0]  # J1: kinematic (world-connected)
 
-        # Hold object at TCP whenever gripper is partially closed.
-        grip_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
-        if grip_q > 0.005:
+        # Once gripped, hold object at TCP so it cannot slip or freeze.
+        if policy.grasped:
             tcp = data.site_xpos[ctx.tcp_site_id].copy()
-            tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3)
-            world_offset = tcp_rot @ np.array([0.0, 0.0, 0.03], dtype=np.float64)
             qadr = ctx.object_qpos_adr["anomaly_0"]
             dadr = ctx.object_dof_adr["anomaly_0"]
-            data.qpos[qadr:qadr + 3] = tcp + world_offset
+            data.qpos[qadr:qadr + 3] = tcp + np.array([0, 0, -0.03], dtype=np.float64)
             data.qvel[dadr:dadr + 6] = 0
-            mujoco.mj_forward(model, data)  # update contacts with new object pos
 
         mujoco.mj_step(model, data)
 
@@ -1261,8 +1256,8 @@ def handle_teleop_token(
 ) -> None:
     mapping = {
         # J1 (J_jianbu, base rotation): LEFT / RIGHT arrows
-        "LEFT":  (0, -TELEOP_ARM_STEP),
-        "RIGHT": (0, +TELEOP_ARM_STEP),
+        "LEFT":  (0, +TELEOP_ARM_STEP),
+        "RIGHT": (0, -TELEOP_ARM_STEP),
         # J2 (J_dabi, shoulder lift): UP / DOWN arrows
         "UP":   (1, +TELEOP_ARM_STEP),
         "DOWN": (1, -TELEOP_ARM_STEP),
@@ -1386,8 +1381,7 @@ def run_teleop_episode(
                     handle_teleop_token(token, teleop, cfg)
                 clamp_teleop_targets(model, ctx, teleop)
 
-                j1_err = teleop.arm_target[0] - data.qpos[ctx.arm_qpos_adr[0]]
-                data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.005, 0.005)
+                data.qpos[ctx.arm_qpos_adr[0]] = teleop.arm_target[0]
 
                 if not teleop.paused:
                     move_conveyor_objects(model, data, ctx, active_objects, False, rng)

@@ -1219,17 +1219,16 @@ def run_episode(
         j1_err = ctrl[0] - data.qpos[ctx.arm_qpos_adr[0]]
         data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.005, 0.005)
 
-        # Hold object at TCP whenever gripper is partially closed.
-        grip_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
-        if grip_q > 0.005:
+        # Once gripped, hold object at TCP so it cannot slip or freeze.
+        if policy.grasped:
             tcp = data.site_xpos[ctx.tcp_site_id].copy()
             tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3)
+            # Offset in gripper local frame: 3 cm ahead along Z (approach dir)
             world_offset = tcp_rot @ np.array([0.0, 0.0, 0.03], dtype=np.float64)
             qadr = ctx.object_qpos_adr["anomaly_0"]
             dadr = ctx.object_dof_adr["anomaly_0"]
             data.qpos[qadr:qadr + 3] = tcp + world_offset
             data.qvel[dadr:dadr + 6] = 0
-            mujoco.mj_forward(model, data)  # update contacts with new object pos
 
         mujoco.mj_step(model, data)
 
