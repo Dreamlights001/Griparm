@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 # NOTE: debug_cameras (and thus cv2) MUST be imported before av and mujoco.viewer,
 # otherwise cv2 Qt windows will hang after those modules initialize their codecs/GL.
 from debug_cameras import get_home_pose_from_model
@@ -79,6 +80,22 @@ DEFAULT_CAMERA_XML = Path("env_camera_tuned.xml")
 HIDDEN_OBJECT_QPOS = np.array([-2.0, -2.0, -1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 TELEOP_ARM_STEP = 0.015
 TELEOP_GRIPPER_STEP = 0.0015
+TELEOP_JOINT_SPEED = {
+    "LEFT": (0, +0.4), "RIGHT": (0, -0.4),
+    "UP": (1, +0.75), "DOWN": (1, -0.75),
+    "KP_1": (2, -1.0), "KP_2": (2, +1.0),
+    "KP_4": (3, +1.0), "KP_6": (3, -1.0),
+    "KP_5": (4, -1.0), "KP_8": (4, +1.0),
+    "KP_7": (5, +1.0), "KP_9": (5, -1.0),
+    "KP_ADD": (-1, -0.02),
+    "KP_SUBTRACT": (-1, +0.02),
+}
+X11_KEYSYMS = {
+    "LEFT": 0xFF51, "UP": 0xFF52, "RIGHT": 0xFF53, "DOWN": 0xFF54,
+    "KP_1": 0xFFB1, "KP_2": 0xFFB2, "KP_4": 0xFFB4, "KP_5": 0xFFB5,
+    "KP_6": 0xFFB6, "KP_7": 0xFFB7, "KP_8": 0xFFB8, "KP_9": 0xFFB9,
+    "KP_ADD": 0xFFAB, "KP_SUBTRACT": 0xFFAD,
+}
 
 
 class PolicyState(Enum):
@@ -157,6 +174,62 @@ class TeleopState:
     save_requested: bool = False
     discard_requested: bool = False
     exit_requested: bool = False
+
+
+class X11KeyPoller:
+    """Poll physical key state so MuJoCo teleop supports both hold and tap."""
+
+    def __init__(self, tokens: Iterable[str]):
+        self.display = None
+        self.keycodes: dict[str, int] = {}
+        self.x11 = None
+        if not os.environ.get("DISPLAY"):
+            return
+        try:
+            self.x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+            self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            self.x11.XOpenDisplay.restype = ctypes.c_void_p
+            self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            self.x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            self.x11.XKeysymToKeycode.restype = ctypes.c_uint
+            self.x11.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char * 32)]
+            self.x11.XQueryKeymap.restype = ctypes.c_int
+            self.display = self.x11.XOpenDisplay(None)
+            if not self.display:
+                return
+            for token in tokens:
+                keysym = X11_KEYSYMS.get(token)
+                if keysym is None:
+                    continue
+                keycode = self.x11.XKeysymToKeycode(self.display, keysym)
+                if keycode:
+                    self.keycodes[token] = int(keycode)
+        except Exception:
+            self.close()
+
+    @property
+    def available(self) -> bool:
+        return bool(self.display and self.keycodes)
+
+    def pressed_tokens(self) -> set[str]:
+        if not self.available:
+            return set()
+        keymap = (ctypes.c_char * 32)()
+        if not self.x11.XQueryKeymap(self.display, ctypes.byref(keymap)):
+            return set()
+        pressed = set()
+        for token, keycode in self.keycodes.items():
+            byte = keymap[keycode // 8]
+            if isinstance(byte, bytes):
+                byte = byte[0]
+            if byte & (1 << (keycode % 8)):
+                pressed.add(token)
+        return pressed
+
+    def close(self) -> None:
+        if self.display and self.x11:
+            self.x11.XCloseDisplay(self.display)
+        self.display = None
 
 
 def _indent(elem: ET.Element, level: int = 0) -> None:
@@ -668,6 +741,60 @@ def glfw_key_to_token(keycode: int) -> str | None:
         glfw.KEY_KP_ENTER: "KP_ENTER",
     }
     return mapping.get(keycode)
+
+
+def claw_anomaly_contact_flags(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    ctx: SimContext,
+) -> tuple[bool, bool]:
+    left_contact = False
+    right_contact = False
+    for i in range(data.ncon):
+        c = data.contact[i]
+        b1 = model.geom_bodyid[c.geom1]
+        b2 = model.geom_bodyid[c.geom2]
+        other = None
+        if b1 == ctx.anomaly_body_id:
+            other = b2
+        elif b2 == ctx.anomaly_body_id:
+            other = b1
+        if other == ctx.claw_left_body_id:
+            left_contact = True
+        elif other == ctx.claw_right_body_id:
+            right_contact = True
+        if left_contact and right_contact:
+            break
+    return left_contact, right_contact
+
+
+def has_two_claw_anomaly_contact(model: mujoco.MjModel, data: mujoco.MjData, ctx: SimContext) -> bool:
+    return all(claw_anomaly_contact_flags(model, data, ctx))
+
+
+def attach_anomaly_to_tcp(data: mujoco.MjData, ctx: SimContext) -> dict[str, np.ndarray]:
+    tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+    tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3).copy()
+    obj_pos = data.xpos[ctx.anomaly_body_id].copy()
+    obj_rot = data.xmat[ctx.anomaly_body_id].reshape(3, 3).copy()
+    return {
+        "rel_pos": tcp_rot.T @ (obj_pos - tcp_pos),
+        "rel_rot": tcp_rot.T @ obj_rot,
+    }
+
+
+def update_attached_anomaly(data: mujoco.MjData, ctx: SimContext, attached: dict[str, np.ndarray] | None) -> None:
+    if attached is None:
+        return
+    tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+    tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3).copy()
+    obj_pos = tcp_pos + tcp_rot @ attached["rel_pos"]
+    obj_rot = tcp_rot @ attached["rel_rot"]
+    qadr = ctx.object_qpos_adr["anomaly_0"]
+    dadr = ctx.object_dof_adr["anomaly_0"]
+    data.qpos[qadr:qadr + 3] = obj_pos
+    data.qpos[qadr + 3:qadr + 7] = matrix_to_quat(obj_rot)
+    data.qvel[dadr:dadr + 6] = 0.0
 
 
 def expert_policy(
@@ -1259,39 +1386,6 @@ def handle_teleop_token(
     teleop: TeleopState,
     cfg: EpisodeConfig,
 ) -> None:
-    mapping = {
-        # J1 (J_jianbu, base rotation): LEFT / RIGHT arrows
-        "LEFT":  (0, -TELEOP_ARM_STEP),
-        "RIGHT": (0, +TELEOP_ARM_STEP),
-        # J2 (J_dabi, shoulder lift): UP / DOWN arrows
-        "UP":   (1, +TELEOP_ARM_STEP),
-        "DOWN": (1, -TELEOP_ARM_STEP),
-        # J3 (J_Upper): numpad 1 / 2
-        "KP_1": (2, -TELEOP_ARM_STEP),
-        "KP_2": (2, +TELEOP_ARM_STEP),
-        # J4 (J_Lower): numpad 4 / 6
-        "KP_4": (3, +TELEOP_ARM_STEP),
-        "KP_6": (3, -TELEOP_ARM_STEP),
-        # J5 (J_wrist): numpad 5 / 8
-        "KP_5": (4, -TELEOP_ARM_STEP),
-        "KP_8": (4, +TELEOP_ARM_STEP),
-        # J6 (J_hand): numpad 7 / 9
-        "KP_7": (5, +TELEOP_ARM_STEP),
-        "KP_9": (5, -TELEOP_ARM_STEP),
-        # J7 gripper (URDF: qpos0=0=open, 0.04=closed)
-        "KP_SUBTRACT": (6, +TELEOP_GRIPPER_STEP),  # close (→0.04)
-        "KP_ADD":      (6, -TELEOP_GRIPPER_STEP),  # open  (→0)
-    }
-    if token in mapping:
-        idx, delta = mapping[token]
-        if idx < 6:
-            teleop.arm_target[idx] += delta
-        else:
-            teleop.gripper_target += delta
-            lo = min(cfg.gripper_open, cfg.gripper_closed)
-            hi = max(cfg.gripper_open, cfg.gripper_closed)
-            teleop.gripper_target = max(lo, min(hi, teleop.gripper_target))
-        return
     if token == "8":
         teleop.paused = not teleop.paused
         return
@@ -1303,6 +1397,20 @@ def handle_teleop_token(
         return
     if token == "ESC":
         teleop.exit_requested = True
+
+
+def apply_teleop_motion(active_tokens: Iterable[str], teleop: TeleopState, cfg: EpisodeConfig, dt: float) -> None:
+    for token in active_tokens:
+        if token not in TELEOP_JOINT_SPEED:
+            continue
+        idx, speed = TELEOP_JOINT_SPEED[token]
+        if idx >= 0:
+            teleop.arm_target[idx] += speed * dt
+        else:
+            teleop.gripper_target += speed * dt
+            lo = min(cfg.gripper_open, cfg.gripper_closed)
+            hi = max(cfg.gripper_open, cfg.gripper_closed)
+            teleop.gripper_target = max(lo, min(hi, teleop.gripper_target))
 
 
 def clamp_teleop_targets(model: mujoco.MjModel, ctx: SimContext, teleop: TeleopState) -> None:
@@ -1344,9 +1452,11 @@ def run_teleop_episode(
     last_log = 0.0
     preview = PreviewBackend.create_auto(preview_backend)
     saved = False
+    attached: dict[str, np.ndarray] | None = None
+    tap_until: dict[str, float] = {}
+    key_poller = X11KeyPoller(TELEOP_JOINT_SPEED.keys())
+    tap_hold_sec = 0.08 if key_poller.available else 0.55
     # Thread-safe key event queue (populated by GLFW callback in viewer thread).
-    # We drain it fully each frame, applying deltas per event.
-    # Simultaneous keys produce independent events — all get processed.
     key_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
 
     print(
@@ -1354,6 +1464,10 @@ def run_teleop_episode(
         "numpad 1/2(J3)  numpad 4/6(J4)  numpad 5/8(J5)  numpad 7/9(J6)  numpad -/+(gripper) ; "
         "ENTER=save  numpad .=discard  8=pause  ESC=quit"
     )
+    if key_poller.available:
+        print("[teleop] key mode: hold + tap (X11 polling enabled)")
+    else:
+        print("[teleop] key mode: tap/repeat fallback (X11 polling unavailable)")
 
     def on_key(keycode: int) -> None:
         token = glfw_key_to_token(keycode)
@@ -1373,26 +1487,50 @@ def run_teleop_episode(
                 if not viewer.is_running():
                     break
 
-                # Drain ALL queued key events and deduplicate per frame.
-                # Each unique key applies its delta once this frame.
-                seen: set[str] = set()
+                # Motion keys create a short tap pulse; X11 polling keeps the
+                # same token active while the key is physically held.
                 while True:
                     try:
                         token = key_queue.get_nowait()
                     except queue.Empty:
                         break
-                    seen.add(token)
-                for token in seen:
-                    handle_teleop_token(token, teleop, cfg)
+                    if token in TELEOP_JOINT_SPEED:
+                        tap_until[token] = time.monotonic() + tap_hold_sec
+                    else:
+                        handle_teleop_token(token, teleop, cfg)
+                now = time.monotonic()
+                active_tokens = key_poller.pressed_tokens()
+                for token, until in list(tap_until.items()):
+                    if until > now:
+                        active_tokens.add(token)
+                    else:
+                        del tap_until[token]
+                apply_teleop_motion(active_tokens, teleop, cfg, model.opt.timestep)
                 clamp_teleop_targets(model, ctx, teleop)
 
                 j1_err = teleop.arm_target[0] - data.qpos[ctx.arm_qpos_adr[0]]
-                data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.005, 0.005)
+                data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.4 * model.opt.timestep, 0.4 * model.opt.timestep)
 
                 if not teleop.paused:
-                    move_conveyor_objects(model, data, ctx, active_objects, False, rng)
+                    move_conveyor_objects(model, data, ctx, active_objects, attached is not None, rng)
                 ctrl = teleop_policy(data, ctx, teleop)
+                if attached is not None:
+                    mujoco.mj_forward(model, data)
+                    update_attached_anomaly(data, ctx, attached)
+                    mujoco.mj_forward(model, data)
                 mujoco.mj_step(model, data)
+                two_claw_contact = has_two_claw_anomaly_contact(model, data, ctx)
+                if attached is not None and not two_claw_contact:
+                    attached = None
+                    print("[teleop grasp] released: lost two-claw contact")
+                elif attached is None and teleop.gripper_target > 0.006 and two_claw_contact:
+                    mujoco.mj_forward(model, data)
+                    attached = attach_anomaly_to_tcp(data, ctx)
+                    print("[teleop grasp] attached anomaly_0 to tcp_site: two-claw contact")
+                if attached is not None:
+                    mujoco.mj_forward(model, data)
+                    update_attached_anomaly(data, ctx, attached)
+                    mujoco.mj_forward(model, data)
 
                 if step % SAMPLE_EVERY == 0:
                     capture_dataset_frame(model, data, renderer, dataset, ctx, ctrl)
@@ -1403,7 +1541,7 @@ def run_teleop_episode(
                     img_wrist = rotate_wrist_frame(render_rgb(renderer, data, ctx.camera_wrist))
                     overlay = (
                         f"teleop paused={teleop.paused} frames={sample_count} "
-                        f"save[Z] discard[X]"
+                        f"save[Enter] discard[KP .]"
                     )
                     preview.show(img_global, img_wrist, overlay)
 
@@ -1431,6 +1569,7 @@ def run_teleop_episode(
                 if sample_count >= MAX_DATA_FRAMES:
                     break
     finally:
+        key_poller.close()
         preview.close()
 
     if not saved:

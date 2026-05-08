@@ -16,6 +16,8 @@ conda run -n sim_env python calibrate_grasp.py
 
 键位与 `collect_data.py --mode teleop` 一致：
 
+方向键和小键盘支持长按连续运动，也支持连点微调。抓取时先进行正常碰撞仿真，只有 anomaly 同时被左右两个爪片夹到，才临时附着到 TCP；失去双爪同时接触后会立即释放并掉落。
+
 | 按键 | 关节 |
 |------|------|
 | ← → | J1 底座扭转 |
@@ -42,8 +44,8 @@ conda run -n sim_env python calibrate_grasp.py
 3. 按 i 查看 TCP 与物体相对位置
 4. 调整到位后按 m → 保存到 calib_grasp.json
 5. 按 g 测试抓取 → 脚本闭合夹爪并尝试提升
-   - 成功：物体随夹爪上升 → SUCCESS
-   - 失败：夹爪闭合太紧/太松 → 调整后重试
+   - 成功：终端出现 `two-claw contact`，物体随夹爪上升 → SUCCESS
+   - 失败：没有同时夹到左右两个爪片，或抬升中失去双爪接触 → 调整后重试
 6. 反复调整 + 测试，直到可靠抓取
 7. 退出
 ```

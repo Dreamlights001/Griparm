@@ -48,6 +48,11 @@ python collect_data.py --mode auto --episodes 5 --dataset-root Lerobot_datasets/
 
 ## 4. teleop 键位
 
+teleop 与 `calibrate_grasp.py` 使用同一套遥操作逻辑：方向键和小键盘支持长按连续运动，也支持连点微调。进入窗口后终端会提示当前按键模式：
+
+- `hold + tap (X11 polling enabled)`：Ubuntu 图形界面下的推荐模式，长按和连点都可用
+- `tap/repeat fallback`：无法读取 X11 键盘状态时的回退模式，依赖系统按键 repeat
+
 | 按键 | 关节 |
 |------|------|
 | ← → | J1 底座扭转 |
@@ -58,6 +63,12 @@ python collect_data.py --mode auto --episodes 5 --dataset-root Lerobot_datasets/
 | 小键盘 7 / 9 | J6 |
 | 小键盘 - | 夹爪闭合 |
 | 小键盘 + | 夹爪张开 |
+
+teleop 抓取逻辑：
+
+- 夹爪先按 MuJoCo 碰撞物理闭合，不会一闭合就直接刚性吸附物体
+- 只有 anomaly 同时接触左、右两个爪片时，才建立临时 TCP 附着，保证采集时物体跟随夹爪移动
+- 只要双爪同时接触被打破，就立即解除附着，物体恢复自由体并掉落；如果掉落中再次同时接触两个爪片，会再次附着
 
 | 功能键 | 作用 |
 |--------|------|

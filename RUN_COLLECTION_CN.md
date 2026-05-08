@@ -65,6 +65,12 @@ python collect_data.py --mode auto --episodes 50 --dataset-root Lerobot_datasets
 python collect_data.py --mode teleop --episodes 5 --dataset-root Lerobot_datasets/teleop_run
 ```
 
+遥操作采集说明：
+
+- 键位与 `calibrate_grasp.py` 一致，方向键和小键盘支持长按连续运动，也支持连点微调。
+- 夹爪闭合后，只有瑕疵品同时接触左、右两个爪片，才会建立临时 TCP 附着并随夹爪移动。
+- 释放不再要求夹爪完全张开；只要双爪同时接触被打破，物体就解除附着并按物理掉落，掉落中再次双爪接触会再次附着。
+
 ## 8. 项目文件说明
 
 | 文件 | 作用 |
