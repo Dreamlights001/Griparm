@@ -44,9 +44,84 @@ def quat_to_matrix(q):
                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], dtype=np.float64)
 
 
+def matrix_to_quat(rot):
+    trace = float(np.trace(rot))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (rot[2, 1] - rot[1, 2]) / s
+        y = (rot[0, 2] - rot[2, 0]) / s
+        z = (rot[1, 0] - rot[0, 1]) / s
+    else:
+        i = int(np.argmax(np.diag(rot)))
+        if i == 0:
+            s = math.sqrt(max(1.0 + rot[0, 0] - rot[1, 1] - rot[2, 2], 1e-12)) * 2.0
+            w = (rot[2, 1] - rot[1, 2]) / s
+            x = 0.25 * s
+            y = (rot[0, 1] + rot[1, 0]) / s
+            z = (rot[0, 2] + rot[2, 0]) / s
+        elif i == 1:
+            s = math.sqrt(max(1.0 + rot[1, 1] - rot[0, 0] - rot[2, 2], 1e-12)) * 2.0
+            w = (rot[0, 2] - rot[2, 0]) / s
+            x = (rot[0, 1] + rot[1, 0]) / s
+            y = 0.25 * s
+            z = (rot[1, 2] + rot[2, 1]) / s
+        else:
+            s = math.sqrt(max(1.0 + rot[2, 2] - rot[0, 0] - rot[1, 1], 1e-12)) * 2.0
+            w = (rot[1, 0] - rot[0, 1]) / s
+            x = (rot[0, 2] + rot[2, 0]) / s
+            y = (rot[1, 2] + rot[2, 1]) / s
+            z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    return q / (np.linalg.norm(q) + 1e-12)
+
+
 def normalize(v):
     n = np.linalg.norm(v)
     return v / n if n > 1e-12 else np.zeros_like(v)
+
+
+def object_freejoint_addr(model, body_id):
+    if model.body_jntnum[body_id] < 1:
+        raise RuntimeError(f"Body {body_id} is expected to have a freejoint.")
+    jid = model.body_jntadr[body_id]
+    return model.jnt_qposadr[jid], model.jnt_dofadr[jid]
+
+
+def has_claw_anomaly_contact(model, data, anomaly_body_id, claw_left_body_id, claw_right_body_id):
+    claw_bodies = {claw_left_body_id, claw_right_body_id}
+    for i in range(data.ncon):
+        c = data.contact[i]
+        b1 = model.geom_bodyid[c.geom1]
+        b2 = model.geom_bodyid[c.geom2]
+        if (b1 == anomaly_body_id and b2 in claw_bodies) or (b2 == anomaly_body_id and b1 in claw_bodies):
+            return True
+    return False
+
+
+def attach_object_to_tcp(model, data, tcp_site_id, object_body_id):
+    mujoco.mj_forward(model, data)
+    tcp_pos = data.site_xpos[tcp_site_id].copy()
+    tcp_rot = data.site_xmat[tcp_site_id].reshape(3, 3).copy()
+    obj_pos = data.xpos[object_body_id].copy()
+    obj_rot = data.xmat[object_body_id].reshape(3, 3).copy()
+    return {
+        "rel_pos": tcp_rot.T @ (obj_pos - tcp_pos),
+        "rel_rot": tcp_rot.T @ obj_rot,
+    }
+
+
+def update_attached_object(model, data, tcp_site_id, object_body_id, attached):
+    if attached is None:
+        return
+    tcp_pos = data.site_xpos[tcp_site_id].copy()
+    tcp_rot = data.site_xmat[tcp_site_id].reshape(3, 3).copy()
+    obj_pos = tcp_pos + tcp_rot @ attached["rel_pos"]
+    obj_rot = tcp_rot @ attached["rel_rot"]
+    qadr, dadr = object_freejoint_addr(model, object_body_id)
+    data.qpos[qadr:qadr + 3] = obj_pos
+    data.qpos[qadr + 3:qadr + 7] = matrix_to_quat(obj_rot)
+    data.qvel[dadr:dadr + 6] = 0.0
 
 
 def apply_lighting(model):
@@ -230,6 +305,7 @@ JOINT_MAP = {
 def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
     anomaly_qadr = model.jnt_qposadr[model.body_jntadr[abid]]
     start_z = data.qpos[anomaly_qadr + 2]
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "tcp_site")
     claw_left_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_left")
     claw_right_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_right")
 
@@ -244,12 +320,7 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
             data.ctrl[aid] = data.qpos[model.jnt_qposadr[arm_jids[arm_aids.index(aid)]]]
         data.qpos[model.jnt_qposadr[arm_jids[0]]] = data.ctrl[arm_aids[0]]
         mujoco.mj_step(model, data)
-        for i in range(data.ncon):
-            c = data.contact[i]
-            b1, b2 = model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2]
-            if abid in (b1, b2) and (claw_left_bid in (b1, b2) or claw_right_bid in (b1, b2)):
-                has_contact = True
-                break
+        has_contact = has_claw_anomaly_contact(model, data, abid, claw_left_bid, claw_right_bid)
         if has_contact:
             break
 
@@ -260,6 +331,7 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
         print("[test] FAILED — no contact")
         return False
 
+    attached = attach_object_to_tcp(model, data, sid, abid)
     print("[test] Lifting ...")
     for step in range(300):
         data.ctrl[gaid] = grip_q
@@ -272,7 +344,13 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
             data.qpos[model.jnt_qposadr[jid]] = q
             data.ctrl[aid] = q
         data.qpos[model.jnt_qposadr[arm_jids[0]]] = data.ctrl[arm_aids[0]]
+        mujoco.mj_forward(model, data)
+        update_attached_object(model, data, sid, abid, attached)
+        mujoco.mj_forward(model, data)
         mujoco.mj_step(model, data)
+        mujoco.mj_forward(model, data)
+        update_attached_object(model, data, sid, abid, attached)
+        mujoco.mj_forward(model, data)
 
     end_z = data.qpos[anomaly_qadr + 2]
     lifted = end_z > start_z + 0.005
@@ -280,6 +358,7 @@ def test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid):
 
     data.ctrl[gaid] = GRIPPER_OPEN
     data.ctrl[graid] = 0.0
+    attached = None
     for _ in range(100):
         for aid in arm_aids:
             data.ctrl[aid] = data.qpos[model.jnt_qposadr[arm_jids[arm_aids.index(aid)]]]
@@ -299,10 +378,13 @@ def main():
     data = mujoco.MjData(model)
 
     arm_jids, arm_aids, gid, gaid, graid, sid, abid = resolve_ids(model)
+    claw_left_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_left")
+    claw_right_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_right")
     key_token = make_key_token_mapping()
     rng = np.random.default_rng()
     arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
     grip_target = GRIPPER_OPEN
+    attached = None
     print_help()
 
     key_queue = []
@@ -350,6 +432,7 @@ def main():
                             rng = np.random.default_rng()
                             arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
                             grip_target = GRIPPER_OPEN
+                            attached = None
                             print("[reset]")
                         elif k == "i":
                             tcp_pos = data.site_xpos[sid].copy()
@@ -380,6 +463,7 @@ def main():
                             rng = np.random.default_rng()
                             arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
                             grip_target = GRIPPER_OPEN
+                            attached = None
                     elif k in joint_speed:
                         tap_until[k] = time.monotonic() + tap_hold_sec
 
@@ -417,7 +501,24 @@ def main():
                 j1_err = arm_target[0] - data.qpos[model.jnt_qposadr[arm_jids[0]]]
                 data.qpos[model.jnt_qposadr[arm_jids[0]]] += np.clip(j1_err, -0.4 * dt, 0.4 * dt)
 
+                if attached is not None and grip_target <= GRIPPER_OPEN + 0.003:
+                    attached = None
+                    print("[grasp] released")
+                if attached is not None:
+                    mujoco.mj_forward(model, data)
+                    update_attached_object(model, data, sid, abid, attached)
+                    mujoco.mj_forward(model, data)
+
                 mujoco.mj_step(model, data)
+                if attached is None and grip_target > 0.006 and has_claw_anomaly_contact(
+                    model, data, abid, claw_left_bid, claw_right_bid
+                ):
+                    attached = attach_object_to_tcp(model, data, sid, abid)
+                    print("[grasp] attached anomaly_0 to tcp_site")
+                if attached is not None:
+                    mujoco.mj_forward(model, data)
+                    update_attached_object(model, data, sid, abid, attached)
+                    mujoco.mj_forward(model, data)
                 viewer.sync()
                 step += 1
         finally:
