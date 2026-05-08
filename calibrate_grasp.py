@@ -7,7 +7,8 @@ Key bindings match collect_data.py teleop mode:
   m  save → calib_grasp.json   g  test grasp   r  reset   i  info   ESC  quit
 """
 
-import json, math, os, sys
+import ctypes
+import json, math, os, sys, time
 
 os.environ.setdefault("MUJOCO_GL", "glfw")
 os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
@@ -152,6 +153,70 @@ def make_key_token_mapping():
     }
 
 
+X11_KEYSYMS = {
+    "LEFT": 0xFF51, "UP": 0xFF52, "RIGHT": 0xFF53, "DOWN": 0xFF54,
+    "KP_1": 0xFFB1, "KP_2": 0xFFB2, "KP_4": 0xFFB4, "KP_5": 0xFFB5,
+    "KP_6": 0xFFB6, "KP_7": 0xFFB7, "KP_8": 0xFFB8, "KP_9": 0xFFB9,
+    "KP_ADD": 0xFFAB, "KP_SUBTRACT": 0xFFAD,
+}
+
+
+class X11KeyPoller:
+    """Poll physical key state so teleop supports holding keys in MuJoCo viewer."""
+
+    def __init__(self, tokens):
+        self.display = None
+        self.keycodes = {}
+        self.x11 = None
+        if not os.environ.get("DISPLAY"):
+            return
+        try:
+            self.x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+            self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            self.x11.XOpenDisplay.restype = ctypes.c_void_p
+            self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            self.x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            self.x11.XKeysymToKeycode.restype = ctypes.c_uint
+            self.x11.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char * 32)]
+            self.x11.XQueryKeymap.restype = ctypes.c_int
+            self.display = self.x11.XOpenDisplay(None)
+            if not self.display:
+                return
+            for token in tokens:
+                keysym = X11_KEYSYMS.get(token)
+                if keysym is None:
+                    continue
+                keycode = self.x11.XKeysymToKeycode(self.display, keysym)
+                if keycode:
+                    self.keycodes[token] = int(keycode)
+        except Exception:
+            self.close()
+
+    @property
+    def available(self):
+        return bool(self.display and self.keycodes)
+
+    def pressed_tokens(self):
+        if not self.available:
+            return set()
+        keymap = (ctypes.c_char * 32)()
+        if not self.x11.XQueryKeymap(self.display, ctypes.byref(keymap)):
+            return set()
+        pressed = set()
+        for token, keycode in self.keycodes.items():
+            byte = keymap[keycode // 8]
+            if isinstance(byte, bytes):
+                byte = byte[0]
+            if byte & (1 << (keycode % 8)):
+                pressed.add(token)
+        return pressed
+
+    def close(self):
+        if self.display and self.x11:
+            self.x11.XCloseDisplay(self.display)
+        self.display = None
+
+
 JOINT_MAP = {
     "LEFT": (0, +TELEOP_ARM_STEP), "RIGHT": (0, -TELEOP_ARM_STEP),
     "UP":   (1, +TELEOP_ARM_STEP), "DOWN":  (1, -TELEOP_ARM_STEP),
@@ -251,8 +316,7 @@ def main():
         model, data, key_callback=on_key, show_left_ui=False, show_right_ui=False
     ) as viewer:
         dt = 1.0 / PHYSICS_HZ
-        HOLD_STEPS = 30  # ~60ms — bridges GLFW repeat gaps
-        hold_until: dict[str, int] = {}
+        tap_until: dict[str, float] = {}
         one_shot = {"ESC", "r", "i", "m", "g"}
         joint_speed = {  # rad/s per token
             "LEFT": (0, +0.4), "RIGHT": (0, -0.4),
@@ -264,56 +328,71 @@ def main():
             "KP_ADD":      (-1, -0.02),  # grip open (speed)
             "KP_SUBTRACT": (-1, +0.02),  # grip close (speed)
         }
+        key_poller = X11KeyPoller(joint_speed.keys())
+        tap_hold_sec = 0.08 if key_poller.available else 0.55
+        if key_poller.available:
+            print("[teleop] key mode: hold + tap (X11 polling enabled)")
+        else:
+            print("[teleop] key mode: tap/repeat fallback (X11 polling unavailable)")
 
         step = 0
-        while viewer.is_running():
-            # Drain key events, refresh hold timers
-            while key_queue:
-                k = key_queue.pop(0)
-                if k in one_shot:
-                    if k == "ESC":
-                        viewer.close()
-                        break
-                    elif k == "r":
-                        rng = np.random.default_rng()
-                        arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
-                        grip_target = GRIPPER_OPEN
-                        print("[reset]")
-                    elif k == "i":
-                        tcp_pos = data.site_xpos[sid].copy()
-                        obj_pos = data.xpos[abid].copy()
-                        obj_rot = quat_to_matrix(data.xquat[abid])
-                        obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
-                        tcp_rot = data.site_xmat[sid].reshape(3, 3)
-                        grip_x_xy = normalize(np.array([tcp_rot[0, 0], tcp_rot[1, 0], 0.0]))
-                        perp = abs(np.dot(grip_x_xy, obj_axis_xy))
-                        print(f"[info] TCP={np.round(tcp_pos,3)}  obj={np.round(obj_pos,3)}  perp={perp:.4f}")
-                    elif k == "m":
-                        arm_q = [float(arm_target[i]) for i in range(6)]
-                        obj_rot = quat_to_matrix(data.xquat[abid])
-                        obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
-                        tcp_pos = data.site_xpos[sid].copy()
-                        obj_pos = data.xpos[abid].copy()
-                        rel = obj_pos - tcp_pos
-                        calib = {"arm_joints": arm_q, "gripper": grip_target,
-                                 "tcp_world": tcp_pos.tolist(), "object_world": obj_pos.tolist(),
-                                 "object_axis_xy": obj_axis_xy.tolist(), "tcp_to_object": rel.tolist(),
-                                 "arm_joint_names": ARM_JOINTS}
-                        with open(OUTPUT_FILE, "w") as f:
-                            json.dump(calib, f, indent=2)
-                        print(f"\n[SAVED] → {OUTPUT_FILE}")
-                    elif k == "g":
-                        success = test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid)
-                        print(f"[test] grasp {'SUCCESS' if success else 'FAILED'}")
-                        rng = np.random.default_rng()
-                        arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
-                        grip_target = GRIPPER_OPEN
-                elif k in joint_speed:
-                    hold_until[k] = step + HOLD_STEPS
+        try:
+            while viewer.is_running():
+                # Drain key events. Motion keys create a short tap pulse; X11 polling
+                # below keeps the same token active while the key is physically held.
+                while key_queue:
+                    k = key_queue.pop(0)
+                    if k in one_shot:
+                        if k == "ESC":
+                            viewer.close()
+                            break
+                        elif k == "r":
+                            rng = np.random.default_rng()
+                            arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
+                            grip_target = GRIPPER_OPEN
+                            print("[reset]")
+                        elif k == "i":
+                            tcp_pos = data.site_xpos[sid].copy()
+                            obj_pos = data.xpos[abid].copy()
+                            obj_rot = quat_to_matrix(data.xquat[abid])
+                            obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
+                            tcp_rot = data.site_xmat[sid].reshape(3, 3)
+                            grip_x_xy = normalize(np.array([tcp_rot[0, 0], tcp_rot[1, 0], 0.0]))
+                            perp = abs(np.dot(grip_x_xy, obj_axis_xy))
+                            print(f"[info] TCP={np.round(tcp_pos,3)}  obj={np.round(obj_pos,3)}  perp={perp:.4f}")
+                        elif k == "m":
+                            arm_q = [float(arm_target[i]) for i in range(6)]
+                            obj_rot = quat_to_matrix(data.xquat[abid])
+                            obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
+                            tcp_pos = data.site_xpos[sid].copy()
+                            obj_pos = data.xpos[abid].copy()
+                            rel = obj_pos - tcp_pos
+                            calib = {"arm_joints": arm_q, "gripper": grip_target,
+                                     "tcp_world": tcp_pos.tolist(), "object_world": obj_pos.tolist(),
+                                     "object_axis_xy": obj_axis_xy.tolist(), "tcp_to_object": rel.tolist(),
+                                     "arm_joint_names": ARM_JOINTS}
+                            with open(OUTPUT_FILE, "w") as f:
+                                json.dump(calib, f, indent=2)
+                            print(f"\n[SAVED] → {OUTPUT_FILE}")
+                        elif k == "g":
+                            success = test_grasp(model, data, arm_jids, arm_aids, gid, gaid, graid, abid)
+                            print(f"[test] grasp {'SUCCESS' if success else 'FAILED'}")
+                            rng = np.random.default_rng()
+                            arm_target = reset_episode(model, data, arm_jids, arm_aids, gid, gaid, graid, abid, rng)
+                            grip_target = GRIPPER_OPEN
+                    elif k in joint_speed:
+                        tap_until[k] = time.monotonic() + tap_hold_sec
 
-            # Apply continuous motion for all held tokens
-            for token, until in list(hold_until.items()):
-                if until > step:
+                now = time.monotonic()
+                active_tokens = key_poller.pressed_tokens()
+                for token, until in list(tap_until.items()):
+                    if until > now:
+                        active_tokens.add(token)
+                    else:
+                        del tap_until[token]
+
+                # Apply velocity-style motion for both held keys and tap pulses.
+                for token in active_tokens:
                     idx, speed = joint_speed[token]
                     if idx >= 0:
                         arm_target[idx] += speed * dt
@@ -321,28 +400,28 @@ def main():
                         grip_target = max(GRIPPER_OPEN, grip_target + speed * dt)
                     elif token == "KP_SUBTRACT":
                         grip_target = min(GRIPPER_CLOSED, grip_target + speed * dt)
-                else:
-                    del hold_until[token]
 
-            # Clamp joints
-            for idx, jid in enumerate(arm_jids):
-                if model.jnt_limited[jid]:
-                    lo, hi = model.jnt_range[jid]
-                    arm_target[idx] = float(np.clip(arm_target[idx], lo, hi))
+                # Clamp joints
+                for idx, jid in enumerate(arm_jids):
+                    if model.jnt_limited[jid]:
+                        lo, hi = model.jnt_range[jid]
+                        arm_target[idx] = float(np.clip(arm_target[idx], lo, hi))
 
-            # Apply via actuators
-            mujoco.mj_forward(model, data)
-            for i, aid in enumerate(arm_aids):
-                data.ctrl[aid] = arm_target[i]
-            data.ctrl[gaid] = grip_target
-            data.ctrl[graid] = -grip_target
-            # J1: micro-step ramp (smooth as J2–J6 actuators)
-            j1_err = arm_target[0] - data.qpos[model.jnt_qposadr[arm_jids[0]]]
-            data.qpos[model.jnt_qposadr[arm_jids[0]]] += np.clip(j1_err, -0.4 * dt, 0.4 * dt)
+                # Apply via actuators
+                mujoco.mj_forward(model, data)
+                for i, aid in enumerate(arm_aids):
+                    data.ctrl[aid] = arm_target[i]
+                data.ctrl[gaid] = grip_target
+                data.ctrl[graid] = -grip_target
+                # J1: micro-step ramp (smooth as J2-J6 actuators)
+                j1_err = arm_target[0] - data.qpos[model.jnt_qposadr[arm_jids[0]]]
+                data.qpos[model.jnt_qposadr[arm_jids[0]]] += np.clip(j1_err, -0.4 * dt, 0.4 * dt)
 
-            mujoco.mj_step(model, data)
-            viewer.sync()
-            step += 1
+                mujoco.mj_step(model, data)
+                viewer.sync()
+                step += 1
+        finally:
+            key_poller.close()
 
     print("[quit]")
 
