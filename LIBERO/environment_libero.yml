@@ -16,7 +16,7 @@ dependencies:
       - PyOpenGL>=3.1.0
 
       # Numeric / config
-      - numpy>=2.0,<2.3
+      - numpy==1.26.4
       - PyYAML>=6.0
       - tqdm>=4.66
       - packaging>=23.0

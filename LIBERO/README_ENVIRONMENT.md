@@ -25,6 +25,8 @@ conda activate libero
 pip install -r requirements.txt
 ```
 
+`requirements.txt` 中固定使用 `numpy==1.26.4`。不要手动升级到 NumPy 2.x，因为 `robosuite==1.5.2` 的依赖链会安装 `mink==0.0.5`，而该版本要求 `numpy<2.0`。
+
 ## 必须处理的本地包：ledataset
 
 当前采集脚本使用的是本地自定义 LeRobot 数据集封装：
