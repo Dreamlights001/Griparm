@@ -46,14 +46,14 @@ LIBERO/libero_griparm/robosuite_env.py
 ```bash
 cd /home/wang/Griparm/LIBERO
 conda env create -f environment_libero.yml
-conda activate griparm_libero
+conda activate libero
 ```
 
 如果你想自己手动创建环境，也可以参考：
 
 ```bash
-conda create -n griparm_libero python=3.10 -y
-conda activate griparm_libero
+conda create -n libero python=3.10 -y
+conda activate libero
 pip install -r requirements.txt
 ```
 

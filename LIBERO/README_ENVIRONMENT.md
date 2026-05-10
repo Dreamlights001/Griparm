@@ -7,21 +7,21 @@
 ```bash
 cd /home/wang/Griparm/LIBERO
 conda env create -f environment_libero.yml
-conda activate griparm_libero
+conda activate libero
 ```
 
 如果环境已经存在：
 
 ```bash
-conda activate griparm_libero
+conda activate libero
 conda env update -f environment_libero.yml --prune
 ```
 
 ## 备选方式：pip requirements.txt
 
 ```bash
-conda create -n griparm_libero python=3.10 -y
-conda activate griparm_libero
+conda create -n libero python=3.10 -y
+conda activate libero
 pip install -r requirements.txt
 ```
 
@@ -42,7 +42,7 @@ pip install -e /path/to/ledataset_source
 # 方式 2：从旧 sim_env 复制已经可用的包
 python -c "import site; print(site.getsitepackages()[0])"
 cp -r /home/wang/miniconda3/envs/sim_env/lib/python3.10/site-packages/ledataset \
-      /home/wang/miniconda3/envs/griparm_libero/lib/python3.10/site-packages/
+      /home/wang/miniconda3/envs/libero/lib/python3.10/site-packages/
 ```
 
 复制路径需要按你机器上的 conda 安装位置调整。
@@ -97,7 +97,7 @@ export NUMBA_CACHE_DIR=/tmp/robosuite_numba_cache
 
 ```bash
 cd /home/wang/Griparm/LIBERO
-conda activate griparm_libero
+conda activate libero
 python -c "import mujoco, robosuite, glfw, yaml; import ledataset; print('env ok')"
 python scripts/check_scene.py
 ```

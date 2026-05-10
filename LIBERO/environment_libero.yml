@@ -1,4 +1,4 @@
-name: griparm_libero
+name: libero
 channels:
   - conda-forge
   - defaults
