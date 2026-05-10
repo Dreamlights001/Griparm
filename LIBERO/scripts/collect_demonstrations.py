@@ -23,7 +23,7 @@ import mujoco.viewer
 import numpy as np
 import yaml
 
-from libero_griparm import GriparmSortingEnv
+from libero_griparm import GriparmRobosuiteEnv
 from libero_griparm.env import ARM_JOINTS, GRIPPER_JOINT
 
 
@@ -127,7 +127,7 @@ def add_lerobot_frame(dataset, obs: dict[str, np.ndarray], action: np.ndarray, t
     })
 
 
-def collect_one(env: GriparmSortingEnv, dataset, cfg: dict, seed: int, use_viewer: bool) -> bool:
+def collect_one(env, dataset, cfg: dict, seed: int, use_viewer: bool) -> bool:
     obs = env.reset(seed=seed)
     action = np.zeros(7, dtype=np.float64)
     action[:6] = env.data.qpos[env.ids.arm_qpos_adr]
@@ -141,7 +141,11 @@ def collect_one(env: GriparmSortingEnv, dataset, cfg: dict, seed: int, use_viewe
         if token is not None:
             key_queue.put(token)
 
-    viewer_ctx = mujoco.viewer.launch_passive(env.model, env.data, key_callback=on_key) if use_viewer else None
+    viewer_ctx = (
+        mujoco.viewer.launch_passive(env.native_model, env.native_data, key_callback=on_key)
+        if use_viewer
+        else None
+    )
     try:
         for _ in range(max_steps):
             while True:
@@ -197,13 +201,17 @@ def main() -> None:
         shutil.rmtree(output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    env = GriparmSortingEnv(
+    max_steps = int(float(cfg["max_episode_seconds"]) * int(cfg["control_hz"]))
+    env = GriparmRobosuiteEnv(
         xml_path=(ROOT / cfg["scene_xml"]).resolve(),
         physics_hz=int(cfg["physics_hz"]),
         control_hz=int(cfg["control_hz"]),
         conveyor_speed=float(cfg["conveyor_speed"]),
         width=int(cfg["image_width"]),
         height=int(cfg["image_height"]),
+        horizon=max_steps,
+        has_renderer=False,
+        has_offscreen_renderer=True,
     )
     dataset = make_lerobot_dataset(
         output,

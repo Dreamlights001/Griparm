@@ -2,7 +2,6 @@ task_name: griparm_pick_anomaly
 language_instruction: pick up the defective cylinder and place it in the pink sorting region
 
 scene_xml: scenes/griparm_sorting.xml
-bddl_file: bddl_files/griparm_sorting/pick_anomaly.bddl
 dataset_path: datasets/griparm_pick_anomaly_lerobot
 
 physics_hz: 500

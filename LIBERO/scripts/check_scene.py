@@ -13,19 +13,22 @@ sys.path.insert(0, str(ROOT))
 
 import yaml
 
-from libero_griparm import GriparmSortingEnv
+from libero_griparm import GriparmRobosuiteEnv
 
 
 def main() -> None:
     config = ROOT / "configs/griparm_sorting.yaml"
     cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
-    env = GriparmSortingEnv(
+    env = GriparmRobosuiteEnv(
         xml_path=ROOT / cfg["scene_xml"],
         physics_hz=int(cfg["physics_hz"]),
         control_hz=int(cfg["control_hz"]),
         conveyor_speed=float(cfg["conveyor_speed"]),
         width=int(cfg["image_width"]),
         height=int(cfg["image_height"]),
+        horizon=int(float(cfg["max_episode_seconds"]) * int(cfg["control_hz"])),
+        has_renderer=False,
+        has_offscreen_renderer=True,
     )
     try:
         obs = env.reset(seed=0)
