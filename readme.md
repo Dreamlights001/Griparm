@@ -235,6 +235,8 @@ python scripts/collect_demonstrations.py --num-demos 10
 
 - `deg/s = rad/s × 57.2958`
 - `rpm = rad/s × 60 / (2π) ≈ rad/s × 9.5493`
+- 夹爪齿轮齿条等效换算：`rpm = 60v / (2πr)`，其中 `v` 为齿条线速度，`r` 为小齿轮节圆半径
+- 当前项目模型没有显式建模齿轮半径，下面表格中的夹爪 `rpm` 采用等效假设 `r = 10 mm`
 
 | 关节 | 控制键 | 速度 (rad/s) | 速度 (deg/s) | 速度 (rpm) |
 |------|--------|--------------|--------------|------------|
@@ -244,7 +246,7 @@ python scripts/collect_demonstrations.py --num-demos 10
 | J4 `J_Lower` | `KP_4 / KP_6` | `1.0` | `57.30` | `9.55` |
 | J5 `J_wrist` | `KP_5 / KP_8` | `1.0` | `57.30` | `9.55` |
 | J6 `J_hand` | `KP_7 / KP_9` | `1.0` | `57.30` | `9.55` |
-| 夹爪 `Claw_left` | `KP_+ / KP_-` | `0.02 m/s` | `20.00 mm/s` | `不适用` |
+| 夹爪 `Claw_left` | `KP_+ / KP_-` | `0.02 m/s` | `20.00 mm/s` | `19.10`（等效，`r=10 mm`） |
 
 补充：
 
