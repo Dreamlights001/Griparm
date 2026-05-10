@@ -1,0 +1,22 @@
+task_name: griparm_pick_anomaly
+language_instruction: pick up the defective cylinder and place it in the pink sorting region
+
+scene_xml: scenes/griparm_sorting.xml
+bddl_file: bddl_files/griparm_sorting/pick_anomaly.bddl
+dataset_path: datasets/griparm_pick_anomaly_lerobot
+
+physics_hz: 500
+control_hz: 20
+image_width: 256
+image_height: 256
+camera_names:
+  - global
+  - wrist
+
+conveyor_speed: 0.025
+max_episode_seconds: 60
+num_objects: 4
+num_anomalies: 1
+
+gripper_open: 0.0
+gripper_closed: 0.038

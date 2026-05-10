@@ -1,0 +1,6 @@
+mujoco>=3.2.0
+glfw>=2.10
+numpy>=2.0.0
+PyYAML>=6.0
+lerobot>=0.1.0
+lerobot-dataset>=0.4.0
