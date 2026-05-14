@@ -87,7 +87,7 @@ teleop 抓取逻辑：
 
 ## 5. 自动模式采集流程
 
-专家策略由状态机驱动，物理仿真抓取。auto 模式会优先读取 `calib_grasp.json` 中保存的“TCP 相对物体轴线”的标定参数；如果文件不存在，则退回到物体中心上方的旧策略。
+专家策略由状态机驱动，物理仿真抓取。auto 模式会优先读取 `calib_grasp.json` 中保存的“爪体 `Hand_Link` 相对物体轴线”的标定参数；如果文件不存在，则退回到物体中心上方的旧策略。
 
 ```
 WAITING → TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
@@ -106,7 +106,7 @@ WAITING → TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
 
 标定抓取策略：
 
-- `calib_grasp.json` 中保存的位置被视为抓取前预对准位姿，该位置本身应高于目标物体
+- `calib_grasp.json` 中保存的是爪体 `Hand_Link` 在物体轴线坐标框架下的带符号相对位置；自动执行不使用标定时的世界绝对坐标
 - WAITING 阶段：不会伸臂去够传送带起始端的不可达物体；只有标定预抓取位的位置 IK 残差小于 `--reachable-pos-err` 才开始 TRACKING；等待时终端每约 2 秒打印一次当前残差
 - TRACKING 阶段：按实时物体轴线重建这个标定相对位姿，并随传送带运动目标同步跟踪；只有 TCP 连续稳定到位后才进入下降
 - DESCEND 阶段：保持标定得到的轴向/侧向相对关系不变，同时随目标同步横移，并从标定高度平滑下降 `--grasp-drop`

@@ -520,13 +520,11 @@ def main():
                                 "gripper_body_from_object": rel_obj_to_gripper.tolist(),
                                 "gripper_body_axis_offset": axis_offset,
                                 "gripper_body_side_offset": side_offset,
-                                "gripper_body_axis_offset_abs": abs(axis_offset),
-                                "gripper_body_side_offset_abs": abs(side_offset),
                                 "gripper_body_height_offset": height_offset,
                                 "arm_joint_names": ARM_JOINTS,
                                 "notes": (
-                                    "Auto grasp tracks the gripper body frame Hand_Link relative to the object axis. "
-                                    "Axis and side signs are selected online."
+                                    "Auto grasp tracks the signed relative position of Hand_Link in the object-axis frame. "
+                                    "World coordinates are stored only for debugging."
                                 ),
                             }
                             with open(OUTPUT_FILE, "w") as f:

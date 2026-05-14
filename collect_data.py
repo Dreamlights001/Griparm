@@ -819,8 +819,8 @@ def load_grasp_calibration(path: Path) -> dict | None:
         raw = json.load(f)
 
     if (
-        "gripper_body_axis_offset_abs" in raw
-        and "gripper_body_side_offset_abs" in raw
+        "gripper_body_axis_offset" in raw
+        and "gripper_body_side_offset" in raw
         and "gripper_body_height_offset" in raw
     ):
         raw.setdefault("track_frame", "Hand_Link")
@@ -864,35 +864,23 @@ def calibrated_gripper_body_target(
         return object_pos + np.array([0.0, 0.0, cfg.grasp_height + height_delta], dtype=np.float64)
 
     axis, side, up = object_axis_frame(data, ctx.anomaly_body_id)
-    axis_abs = float(calib.get(
-        "gripper_body_axis_offset_abs",
-        calib.get("tcp_axis_offset_abs", abs(float(calib.get("tcp_axis_offset", 0.0)))),
+    axis_offset = float(calib.get(
+        "gripper_body_axis_offset",
+        calib.get("tcp_axis_offset", 0.0),
     ))
-    side_abs = float(calib.get(
-        "gripper_body_side_offset_abs",
-        calib.get("tcp_side_offset_abs", abs(float(calib.get("tcp_side_offset", 0.0)))),
+    side_offset = float(calib.get(
+        "gripper_body_side_offset",
+        calib.get("tcp_side_offset", 0.0),
     ))
     # Keep a small positive height above object center so a too-large drop
     # cannot drive the gripper body reference below the workpiece centerline.
     base_height = float(calib.get("gripper_body_height_offset", calib.get("tcp_height_offset", 0.0)))
     height = max(0.015, base_height + height_delta)
 
-    if policy.calib_axis_sign == 0.0 or policy.calib_side_sign == 0.0:
-        gripper_body_pos = data.xpos[ctx.hand_body_id].copy()
-        best = None
-        for axis_sign in (-1.0, 1.0):
-            for side_sign in (-1.0, 1.0):
-                candidate = object_pos + axis * (axis_sign * axis_abs) + side * (side_sign * side_abs) + up * height
-                dist = float(np.linalg.norm(candidate - gripper_body_pos))
-                if best is None or dist < best[0]:
-                    best = (dist, axis_sign, side_sign)
-        policy.calib_axis_sign = best[1]
-        policy.calib_side_sign = best[2]
-
     return (
         object_pos
-        + axis * (policy.calib_axis_sign * axis_abs)
-        + side * (policy.calib_side_sign * side_abs)
+        + axis * axis_offset
+        + side * side_offset
         + up * height
     )
 
@@ -1111,10 +1099,6 @@ def expert_policy(
             policy.last_target_quat = target_quat
             print(f"[auto] target reachable: pos_residual={pos_err:.3f}m -> TRACKING")
         else:
-            # Re-evaluate side/axis sign when the target later enters the
-            # reachable window; choosing while far away can lock the wrong side.
-            policy.calib_axis_sign = 0.0
-            policy.calib_side_sign = 0.0
             if policy.step_counter_in_state - policy.last_wait_log_step >= int(2.0 * PHYSICS_HZ):
                 rel = anomaly_pos - ctx.conveyor_start
                 s = float(np.dot(rel, ctx.conveyor_dir))

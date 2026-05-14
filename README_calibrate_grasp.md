@@ -52,36 +52,38 @@ conda run -n sim_env python calibrate_grasp.py
 
 ## 5. 输出文件 `calib_grasp.json`
 
-当前版本保存的是 TCP 相对瑕疵件轴线的局部标定，而不是只保存世界坐标差值。该标定点表示“抓取前预对准位姿”，应当比物体中心高一些；自动采集会先到达并跟踪这个相对位姿，再沿竖直方向下降一小段距离完成闭合抓取。
+当前版本保存的是爪体 `Hand_Link` 相对瑕疵件轴线的局部标定，而不是爪片坐标系，也不是 `tcp_site`。该标定点表示“抓取前预对准位姿”，应当比物体中心高一些；自动采集会先让 `Hand_Link` 到达并跟踪这个相对位姿，再沿竖直方向下降一小段距离完成闭合抓取。
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
+  "track_frame": "Hand_Link",
   "arm_joints": [0.0, -0.5, 0.3, ...],
   "gripper": 0.0,
-  "tcp_world": [0.4, 0.05, 0.08],
+  "gripper_body_world": [0.4, 0.05, 0.08],
   "object_world": [0.4, 0.05, 0.03],
   "object_axis_xy": [1.0, 0.0, 0.0],
   "object_side_xy": [0.0, 1.0, 0.0],
-  "tcp_from_object": [0.0, 0.03, 0.05],
-  "tcp_axis_offset_abs": 0.0,
-  "tcp_side_offset_abs": 0.03,
-  "tcp_height_offset": 0.05,
+  "gripper_body_from_object": [0.0, 0.03, 0.05],
+  "gripper_body_axis_offset": 0.0,
+  "gripper_body_side_offset": 0.03,
+  "gripper_body_height_offset": 0.05,
   "arm_joint_names": ["J_jianbu", "J_dabi", ...]
 }
 ```
 
 | 字段 | 含义 |
 |------|------|
+| `track_frame` | 自动采集跟踪的坐标框架，当前为 `Hand_Link` |
 | `arm_joints` | 6 个关节的目标角度 (rad) |
 | `gripper` | 夹爪位置 (0=开, ~0.048=闭) |
-| `tcp_world` | TCP 在世界坐标的位置 |
+| `gripper_body_world` | 爪体 `Hand_Link` 在世界坐标的位置，仅用于调试记录 |
 | `object_axis_xy` | 瑕疵件轴线在水平面的方向 |
 | `object_side_xy` | 与瑕疵件轴线垂直的水平侧向 |
-| `tcp_from_object` | 标定时从物体中心指向 TCP 的世界坐标向量 |
-| `tcp_axis_offset_abs` | TCP 相对物体轴线方向的绝对偏移；自动执行时不区分轴线正反 |
-| `tcp_side_offset_abs` | TCP 相对物体侧向的绝对偏移；自动执行时自动选择更近的一侧 |
-| `tcp_height_offset` | TCP 高于物体中心的高度偏移 |
+| `gripper_body_from_object` | 标定时从物体中心指向 `Hand_Link` 的世界坐标向量 |
+| `gripper_body_axis_offset` | `Hand_Link` 在物体轴线方向上的带符号相对偏移 |
+| `gripper_body_side_offset` | `Hand_Link` 在物体侧向上的带符号相对偏移 |
+| `gripper_body_height_offset` | `Hand_Link` 高于物体中心的高度偏移 |
 | `arm_joint_names` | 关节名称列表 |
 
 ## 6. 注意事项
@@ -89,6 +91,7 @@ conda run -n sim_env python calibrate_grasp.py
 - 标定时夹爪应张开，将手臂移到目标物体正上方
 - `m` 键保存的是抓取前高位，不是最终闭合时的最低抓取位
 - 自动采集最终闭合高度由 `collect_data.py --grasp-drop` 控制，默认从标定位向下 0.035 m
+- 如果 `collect_data.py` 提示 `legacy tcp_site calibration`，需要重新运行本脚本并按 `m` 保存新版 `Hand_Link` 标定
 - 夹爪应朝下（俯角），保持手腕高于传送带
 - J6 控制手部旋转，确保爪片开合方向与物体长轴垂直
 - 保存后不要移动物体位置，否则相对位置失效
