@@ -120,6 +120,7 @@ class EpisodeConfig:
     tracking_stable_sec: float = 0.08
     descend_sec: float = 1.0
     max_descend_sec: float = 4.0
+    wait_station_s: float = CONVEYOR_LENGTH * 0.5
     reachable_pos_err: float = 0.035
     grasp_hold_sec: float = 0.45
     release_hold_sec: float = 0.30
@@ -889,6 +890,40 @@ def calibrated_tcp_target(*args, **kwargs) -> np.ndarray:
     return calibrated_gripper_body_target(*args, **kwargs)
 
 
+def calibrated_gripper_body_height(cfg: EpisodeConfig, height_delta: float = 0.0) -> float:
+    calib = cfg.grasp_calibration
+    if calib is None:
+        return cfg.grasp_height + height_delta
+    base_height = float(calib.get("gripper_body_height_offset", calib.get("tcp_height_offset", 0.0)))
+    return max(0.015, base_height + height_delta)
+
+
+def wait_station_gripper_body_target(
+    data: mujoco.MjData,
+    ctx: SimContext,
+    cfg: EpisodeConfig,
+    object_pos: np.ndarray,
+    height_delta: float,
+) -> np.ndarray:
+    """Safe preposition target for Hand_Link while the moving part is not grabbable.
+
+    This uses the JSON marked height and current object axis orientation, but
+    deliberately does not use the signed horizontal axis/side offsets yet.
+    The exact horizontal relative relation is applied later in TRACKING.
+    """
+    rel = object_pos - ctx.conveyor_start
+    lat = float(np.dot(rel, ctx.conveyor_lateral))
+    lat = float(np.clip(lat, -CONVEYOR_HALF_WIDTH + LATERAL_MARGIN, CONVEYOR_HALF_WIDTH - LATERAL_MARGIN))
+    s = float(np.clip(cfg.wait_station_s, 0.0, CONVEYOR_LENGTH))
+    station_object_pos = (
+        ctx.conveyor_start
+        + ctx.conveyor_dir * s
+        + ctx.conveyor_lateral * lat
+    )
+    station_object_pos[2] = object_pos[2]
+    return station_object_pos + np.array([0.0, 0.0, calibrated_gripper_body_height(cfg, height_delta)])
+
+
 def object_quat_laid_down(conveyor_dir: np.ndarray, object_yaw_deg: float) -> np.ndarray:
     conveyor_yaw_deg = math.degrees(math.atan2(conveyor_dir[1], conveyor_dir[0]))
     base = quat_from_euler_xyz(0.0, math.radians(90.0), math.radians(conveyor_yaw_deg + object_yaw_deg))
@@ -1080,18 +1115,36 @@ def expert_policy(
 
     if policy.state == PolicyState.WAITING:
         policy.step_counter_in_state += 1
-        target_pos = calibrated_gripper_body_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
+        # First move to a safe high station around the conveyor work area.
+        # Do not apply the signed horizontal calibration offsets until the
+        # actual moving part reaches the graspable window.
+        target_pos = wait_station_gripper_body_target(data, ctx, cfg, predicted_pos, pregrasp_height_delta)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
+        exact_target_pos = calibrated_gripper_body_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
         pos_err = ik_body_position_residual(
             model,
             data,
             ctx.hand_body_id,
-            target_pos,
+            exact_target_pos,
             ctx.arm_qpos_adr,
             ctx.arm_dof_adr,
             max_iter=100,
             damping=0.01,
         )
+        arm_q = solve_ik_dls_body(
+            model,
+            data,
+            ctx.hand_body_id,
+            target_pos,
+            target_quat,
+            ctx.arm_qpos_adr,
+            ctx.arm_dof_adr,
+            max_iter=80,
+            damping=0.01,
+            pos_tol=1e-3,
+            max_dq_per_step=0.08,
+        )
+        ctrl = set_ctrl_from_targets(data, ctx, arm_q, cfg.gripper_open)
         if pos_err <= cfg.reachable_pos_err:
             policy.state = PolicyState.TRACKING
             policy.step_counter_in_state = 0
@@ -1102,9 +1155,11 @@ def expert_policy(
             if policy.step_counter_in_state - policy.last_wait_log_step >= int(2.0 * PHYSICS_HZ):
                 rel = anomaly_pos - ctx.conveyor_start
                 s = float(np.dot(rel, ctx.conveyor_dir))
-                print(f"[auto] waiting: target not reachable yet, s={s:.3f}m pos_residual={pos_err:.3f}m")
+                print(
+                    f"[auto] waiting/preposition: s={s:.3f}m "
+                    f"exact_residual={pos_err:.3f}m station_s={cfg.wait_station_s:.3f}m"
+                )
                 policy.last_wait_log_step = policy.step_counter_in_state
-        ctrl = set_ctrl_from_targets(data, ctx, ctx.home_qpos[ctx.arm_qpos_adr].copy(), cfg.gripper_open)
         policy.last_ctrl = ctrl
         return ctrl
 
@@ -2040,6 +2095,15 @@ def parse_args() -> argparse.Namespace:
             f"Default: {EpisodeConfig.reachable_pos_err}."
         ),
     )
+    parser.add_argument(
+        "--wait-station-s",
+        type=float,
+        default=EpisodeConfig.wait_station_s,
+        help=(
+            "Conveyor coordinate used as the high preposition station in WAITING, in meters from conveyor start. "
+            f"Default: {EpisodeConfig.wait_station_s}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2094,6 +2158,7 @@ def main() -> None:
             calibration_grasp_drop=args.grasp_drop,
             prediction_time=args.prediction_time,
             reachable_pos_err=args.reachable_pos_err,
+            wait_station_s=args.wait_station_s,
         )
 
         renderer = mujoco.Renderer(model, width=args.width, height=args.height)
@@ -2124,6 +2189,7 @@ def main() -> None:
             f"[collect_data] conveyor_speed={cfg.conveyor_speed:.4f}m/s "
             f"prediction_time={cfg.prediction_time:.3f}s "
             f"reachable_pos_err={cfg.reachable_pos_err:.3f}m "
+            f"wait_station_s={cfg.wait_station_s:.3f}m "
             f"max_frames={cfg.max_data_frames} duration={cfg.max_data_frames / DATA_HZ:.1f}s"
         )
         if cfg.grasp_calibration is not None:

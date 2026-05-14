@@ -47,6 +47,7 @@ python collect_data.py --mode auto --episodes 5 --dataset-root Lerobot_datasets/
 | `--grasp-drop` | 0.035 | auto 模式从标定预抓取位向下下降到闭合抓取位的距离，单位 m |
 | `--prediction-time` | 0.5 | 跟踪移动异常品时的前馈预测时间，单位 s；预测方向与传送带实际运动方向一致 |
 | `--reachable-pos-err` | 0.035 | 标定预抓取位的 IK 位置残差阈值；小于该值才认为目标进入可达抓取窗口 |
+| `--wait-station-s` | 0.6 | WAITING 阶段的高位预等待工位，表示距传送带 start 的距离，单位 m |
 | `--no-viewer` | false | 隐藏 MuJoCo viewer（auto 模式） |
 | `--overwrite` | false | 强制覆盖已有数据集 |
 | `--resume` | false | 续写已有数据集 |
@@ -95,7 +96,7 @@ WAITING → TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
 
 | 状态 | 动作 |
 |------|------|
-| WAITING | 目标处于传送带起始端等不可达区域时，机械臂保持 home 姿态和夹爪张开；用 `calib_grasp.json` 重建预抓取位并做位置 IK 可达性检查 |
+| WAITING | 目标还未进入可抓取窗口时，机械臂先移动到传送带中部高位预等待工位；高度使用 JSON 标定高度，姿态保持与物体轴线平行，夹爪张开 |
 | TRACKING | IK 跟踪物体上方预抓取位置 |
 | DESCEND | 下降到抓取高度 |
 | GRASP | 渐进闭合夹爪，接触检测，冻结夹持位 |
@@ -107,8 +108,8 @@ WAITING → TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
 标定抓取策略：
 
 - `calib_grasp.json` 中保存的是爪体 `Hand_Link` 在物体轴线坐标框架下的带符号相对位置；自动执行不使用标定时的世界绝对坐标
-- WAITING 阶段：不会伸臂去够传送带起始端的不可达物体；只有标定预抓取位的位置 IK 残差小于 `--reachable-pos-err` 才开始 TRACKING；等待时终端每约 2 秒打印一次当前残差
-- TRACKING 阶段：按实时物体轴线重建这个标定相对位姿，并随传送带运动目标同步跟踪；只有 TCP 连续稳定到位后才进入下降
+- WAITING 阶段：机械臂先到 `--wait-station-s` 对应的高位预等待工位；此阶段只使用 JSON 高度和轴线平行姿态，不应用轴向/侧向带符号水平偏移
+- TRACKING 阶段：物体进入可抓取窗口后，按实时物体轴线重建完整带符号相对位姿，并随传送带运动目标同步跟踪；只有爪体 `Hand_Link` 连续稳定到位后才进入下降
 - DESCEND 阶段：保持标定得到的轴向/侧向相对关系不变，同时随目标同步横移，并从标定高度平滑下降 `--grasp-drop`
 - GRASP 阶段：在下降后的抓取高度继续跟踪同一个水平相对位置，同时渐进闭合夹爪
 - 物体轴线正反和左右侧不固定，脚本会在候选相对位姿中选择距离当前 TCP 最近的一组
