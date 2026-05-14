@@ -91,6 +91,7 @@ TELEOP_JOINT_SPEED = {
     "KP_ADD": (-1, -0.02),
     "KP_SUBTRACT": (-1, +0.02),
 }
+AUTO_J1_RAMP_SPEED = 0.4
 X11_KEYSYMS = {
     "LEFT": 0xFF51, "UP": 0xFF52, "RIGHT": 0xFF53, "DOWN": 0xFF54,
     "KP_1": 0xFFB1, "KP_2": 0xFFB2, "KP_4": 0xFFB4, "KP_5": 0xFFB5,
@@ -988,6 +989,27 @@ def set_ctrl_from_targets(
     return ctrl
 
 
+def ramp_j1_toward_target(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    ctx: SimContext,
+    target: float,
+    speed: float = AUTO_J1_RAMP_SPEED,
+) -> None:
+    """Drive the continuous base joint smoothly toward the policy target.
+
+    J1 is modeled as a continuous joint. On this arm model the position
+    actuator alone can leave J1 effectively stationary in auto mode, while
+    teleop/calibration already use a small qpos ramp. Keep the same bounded
+    behavior here instead of teleporting the base angle.
+    """
+    qadr = int(ctx.arm_qpos_adr[0])
+    current = float(data.qpos[qadr])
+    err = math.atan2(math.sin(float(target) - current), math.cos(float(target) - current))
+    max_step = float(speed) * float(model.opt.timestep)
+    data.qpos[qadr] = current + float(np.clip(err, -max_step, max_step))
+
+
 def teleop_policy(
     data: mujoco.MjData,
     ctx: SimContext,
@@ -1157,7 +1179,8 @@ def expert_policy(
                 s = float(np.dot(rel, ctx.conveyor_dir))
                 print(
                     f"[auto] waiting/preposition: s={s:.3f}m "
-                    f"exact_residual={pos_err:.3f}m station_s={cfg.wait_station_s:.3f}m"
+                    f"exact_residual={pos_err:.3f}m station_s={cfg.wait_station_s:.3f}m "
+                    f"j1={data.qpos[ctx.arm_qpos_adr[0]]:.3f}->{arm_q[0]:.3f}"
                 )
                 policy.last_wait_log_step = policy.step_counter_in_state
         policy.last_ctrl = ctrl
@@ -1765,6 +1788,8 @@ def run_episode(
             cfg=cfg,
             anomaly_conveyor_speed=cfg.conveyor_speed,
         )
+        ramp_j1_toward_target(model, data, ctx, ctrl[0])
+        mujoco.mj_forward(model, data)
 
         # Hold the grasped object only during transport. Release phase must be
         # a real free-body fall so landing can decide save / retry / discard.
