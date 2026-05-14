@@ -46,6 +46,7 @@ python collect_data.py --mode auto --episodes 5 --dataset-root Lerobot_datasets/
 | `--grasp-calib` | `calib_grasp.json` | auto 模式使用的抓取标定文件 |
 | `--grasp-drop` | 0.035 | auto 模式从标定预抓取位向下下降到闭合抓取位的距离，单位 m |
 | `--prediction-time` | 0.5 | 跟踪移动异常品时的前馈预测时间，单位 s |
+| `--reachable-pos-err` | 0.035 | 标定预抓取位的 IK 位置残差阈值；小于该值才认为目标进入可达抓取窗口 |
 | `--no-viewer` | false | 隐藏 MuJoCo viewer（auto 模式） |
 | `--overwrite` | false | 强制覆盖已有数据集 |
 | `--resume` | false | 续写已有数据集 |
@@ -89,11 +90,12 @@ teleop 抓取逻辑：
 专家策略由状态机驱动，物理仿真抓取。auto 模式会优先读取 `calib_grasp.json` 中保存的“TCP 相对物体轴线”的标定参数；如果文件不存在，则退回到物体中心上方的旧策略。
 
 ```
-TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
+WAITING → TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
 ```
 
 | 状态 | 动作 |
 |------|------|
+| WAITING | 目标处于传送带起始端等不可达区域时，机械臂保持 home 姿态和夹爪张开；用 `calib_grasp.json` 重建预抓取位并做 IK 可达性检查 |
 | TRACKING | IK 跟踪物体上方预抓取位置 |
 | DESCEND | 下降到抓取高度 |
 | GRASP | 渐进闭合夹爪，接触检测，冻结夹持位 |
@@ -105,6 +107,7 @@ TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
 标定抓取策略：
 
 - `calib_grasp.json` 中保存的位置被视为抓取前预对准位姿，该位置本身应高于目标物体
+- WAITING 阶段：不会伸臂去够传送带起始端的不可达物体；只有标定预抓取位的 IK 位置残差小于 `--reachable-pos-err` 才开始 TRACKING
 - TRACKING 阶段：按实时物体轴线重建这个标定相对位姿，并随传送带运动目标同步跟踪；只有 TCP 连续稳定到位后才进入下降
 - DESCEND 阶段：保持标定得到的轴向/侧向相对关系不变，同时随目标同步横移，并从标定高度平滑下降 `--grasp-drop`
 - GRASP 阶段：在下降后的抓取高度继续跟踪同一个水平相对位置，同时渐进闭合夹爪
