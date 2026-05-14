@@ -1878,8 +1878,11 @@ def run_teleop_episode(
     ctx: SimContext,
     cfg: EpisodeConfig,
     rng: random.Random,
-    preview_backend: str,
-) -> bool:
+    viewer: object,
+    key_queue: queue.SimpleQueue[str],
+    key_poller: X11KeyPoller,
+    preview: PreviewBackend,
+) -> tuple[bool, bool]:
     active_objects = reset_episode(model, data, ctx, rng, cfg)
     arm_home = ctx.home_qpos[ctx.arm_qpos_adr].copy()
     # URDF qpos0=0 means gripper OPEN (claws apart). Start teleop with gripper open.
@@ -1900,14 +1903,15 @@ def run_teleop_episode(
     )
     sample_count = 0
     last_log = 0.0
-    preview = PreviewBackend.create_auto(preview_backend)
     saved = False
     attached: dict[str, np.ndarray] | None = None
     tap_until: dict[str, float] = {}
-    key_poller = X11KeyPoller(TELEOP_JOINT_SPEED.keys())
     tap_hold_sec = 0.08 if key_poller.available else 0.55
-    # Thread-safe key event queue (populated by GLFW callback in viewer thread).
-    key_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
+    while True:
+        try:
+            key_queue.get_nowait()
+        except queue.Empty:
+            break
 
     print(
         "[teleop] Keys: LEFT/RIGHT(J1)  UP/DOWN(J2)  "
@@ -1919,124 +1923,108 @@ def run_teleop_episode(
     else:
         print("[teleop] key mode: tap/repeat fallback (X11 polling unavailable)")
 
-    def on_key(keycode: int) -> None:
-        token = glfw_key_to_token(keycode)
-        if token is None:
-            return
-        key_queue.put(token)
+    for step in range(cfg.max_physics_steps):
+        if not viewer.is_running():
+            teleop.exit_requested = True
+            break
 
-    try:
-        with mujoco.viewer.launch_passive(
-            model,
-            data,
-            key_callback=on_key,
-            show_left_ui=False,
-            show_right_ui=False,
-        ) as viewer:
-            for step in range(cfg.max_physics_steps):
-                if not viewer.is_running():
-                    break
+        # Motion keys create a short tap pulse; X11 polling keeps the
+        # same token active while the key is physically held.
+        while True:
+            try:
+                token = key_queue.get_nowait()
+            except queue.Empty:
+                break
+            if token in TELEOP_JOINT_SPEED:
+                tap_until[token] = time.monotonic() + tap_hold_sec
+            else:
+                handle_teleop_token(token, teleop, cfg)
+        now = time.monotonic()
+        active_tokens = key_poller.pressed_tokens()
+        for token, until in list(tap_until.items()):
+            if until > now:
+                active_tokens.add(token)
+            else:
+                del tap_until[token]
+        apply_teleop_motion(active_tokens, teleop, cfg, model.opt.timestep)
+        clamp_teleop_targets(model, ctx, teleop)
 
-                # Motion keys create a short tap pulse; X11 polling keeps the
-                # same token active while the key is physically held.
-                while True:
-                    try:
-                        token = key_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if token in TELEOP_JOINT_SPEED:
-                        tap_until[token] = time.monotonic() + tap_hold_sec
-                    else:
-                        handle_teleop_token(token, teleop, cfg)
-                now = time.monotonic()
-                active_tokens = key_poller.pressed_tokens()
-                for token, until in list(tap_until.items()):
-                    if until > now:
-                        active_tokens.add(token)
-                    else:
-                        del tap_until[token]
-                apply_teleop_motion(active_tokens, teleop, cfg, model.opt.timestep)
-                clamp_teleop_targets(model, ctx, teleop)
+        j1_err = teleop.arm_target[0] - data.qpos[ctx.arm_qpos_adr[0]]
+        data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.4 * model.opt.timestep, 0.4 * model.opt.timestep)
 
-                j1_err = teleop.arm_target[0] - data.qpos[ctx.arm_qpos_adr[0]]
-                data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.4 * model.opt.timestep, 0.4 * model.opt.timestep)
+        if not teleop.paused:
+            move_conveyor_objects(
+                model, data, ctx, active_objects, attached is not None, rng, cfg.conveyor_speed
+            )
+        ctrl = teleop_policy(data, ctx, teleop)
+        if attached is not None:
+            mujoco.mj_forward(model, data)
+            update_attached_anomaly(data, ctx, attached)
+            mujoco.mj_forward(model, data)
+        mujoco.mj_step(model, data)
+        two_claw_contact = has_two_claw_anomaly_contact(model, data, ctx)
+        if attached is not None and not two_claw_contact:
+            attached = None
+            print("[teleop grasp] released: lost two-claw contact")
+        elif attached is None and teleop.gripper_target > 0.006 and two_claw_contact:
+            mujoco.mj_forward(model, data)
+            attached = attach_anomaly_to_tcp(data, ctx)
+            print("[teleop grasp] attached anomaly_0 to tcp_site: two-claw contact")
+        if attached is not None:
+            mujoco.mj_forward(model, data)
+            update_attached_anomaly(data, ctx, attached)
+            mujoco.mj_forward(model, data)
 
-                if not teleop.paused:
-                    move_conveyor_objects(
-                        model, data, ctx, active_objects, attached is not None, rng, cfg.conveyor_speed
-                    )
-                ctrl = teleop_policy(data, ctx, teleop)
-                if attached is not None:
-                    mujoco.mj_forward(model, data)
-                    update_attached_anomaly(data, ctx, attached)
-                    mujoco.mj_forward(model, data)
-                mujoco.mj_step(model, data)
-                two_claw_contact = has_two_claw_anomaly_contact(model, data, ctx)
-                if attached is not None and not two_claw_contact:
-                    attached = None
-                    print("[teleop grasp] released: lost two-claw contact")
-                elif attached is None and teleop.gripper_target > 0.006 and two_claw_contact:
-                    mujoco.mj_forward(model, data)
-                    attached = attach_anomaly_to_tcp(data, ctx)
-                    print("[teleop grasp] attached anomaly_0 to tcp_site: two-claw contact")
-                if attached is not None:
-                    mujoco.mj_forward(model, data)
-                    update_attached_anomaly(data, ctx, attached)
-                    mujoco.mj_forward(model, data)
+        if step % SAMPLE_EVERY == 0:
+            capture_dataset_frame(model, data, renderer, dataset, ctx, ctrl)
+            sample_count += 1
 
-                if step % SAMPLE_EVERY == 0:
-                    capture_dataset_frame(model, data, renderer, dataset, ctx, ctrl)
-                    sample_count += 1
+        if step % SAMPLE_EVERY == 0:
+            img_global = render_rgb(renderer, data, ctx.camera_global)
+            img_wrist = rotate_wrist_frame(render_rgb(renderer, data, ctx.camera_wrist))
+            overlay = (
+                f"teleop paused={teleop.paused} frames={sample_count} "
+                f"save[Enter] discard[KP .]"
+            )
+            preview.show(img_global, img_wrist, overlay)
 
-                if step % SAMPLE_EVERY == 0:
-                    img_global = render_rgb(renderer, data, ctx.camera_global)
-                    img_wrist = rotate_wrist_frame(render_rgb(renderer, data, ctx.camera_wrist))
-                    overlay = (
-                        f"teleop paused={teleop.paused} frames={sample_count} "
-                        f"save[Enter] discard[KP .]"
-                    )
-                    preview.show(img_global, img_wrist, overlay)
+        viewer.sync()
 
-                viewer.sync()
+        if teleop.exit_requested:
+            break
 
-                if teleop.exit_requested:
-                    break
+        if teleop.save_requested:
+            dataset.save_episode()
+            saved = True
+            break
+        if teleop.discard_requested:
+            dataset.clear_episode_buffer(delete_images=True)
+            return False, False
+        if attached is None and anomaly_landed(data, ctx):
+            if anomaly_in_place_region(data, ctx):
+                dataset.save_episode()
+                saved = True
+                print("[teleop] auto-saved: anomaly landed in place region")
+                break
+            if not anomaly_in_conveyor_region(data, ctx):
+                dataset.clear_episode_buffer(delete_images=True)
+                print("[teleop] discarded: anomaly landed outside conveyor/place regions")
+                return False, False
 
-                if teleop.save_requested:
-                    dataset.save_episode()
-                    saved = True
-                    break
-                if teleop.discard_requested:
-                    dataset.clear_episode_buffer(delete_images=True)
-                    return False
-                if attached is None and anomaly_landed(data, ctx):
-                    if anomaly_in_place_region(data, ctx):
-                        dataset.save_episode()
-                        saved = True
-                        print("[teleop] auto-saved: anomaly landed in place region")
-                        break
-                    if not anomaly_in_conveyor_region(data, ctx):
-                        dataset.clear_episode_buffer(delete_images=True)
-                        print("[teleop] discarded: anomaly landed outside conveyor/place regions")
-                        return False
+        now = time.time()
+        if now - last_log > 2.0:
+            last_log = now
+            print(
+                f"[teleop] frames={sample_count} paused={teleop.paused} "
+                f"gripper={teleop.gripper_target:.3f}"
+            )
 
-                now = time.time()
-                if now - last_log > 2.0:
-                    last_log = now
-                    print(
-                        f"[teleop] frames={sample_count} paused={teleop.paused} "
-                        f"gripper={teleop.gripper_target:.3f}"
-                    )
-
-                if sample_count >= cfg.max_data_frames:
-                    break
-    finally:
-        key_poller.close()
-        preview.close()
+        if sample_count >= cfg.max_data_frames:
+            break
 
     if not saved:
         dataset.clear_episode_buffer(delete_images=True)
-    return saved
+    return saved, teleop.exit_requested
 
 
 def parse_args() -> argparse.Namespace:
@@ -2231,24 +2219,68 @@ def main() -> None:
 
         dataset = make_dataset(args.dataset_root, fps=DATA_HZ, width=args.width, height=args.height)
         viewer = None
+        teleop_key_poller: X11KeyPoller | None = None
+        teleop_preview: PreviewBackend | None = None
         try:
             if args.mode == "auto" and not args.no_viewer:
                 viewer = mujoco.viewer.launch_passive(
                     model, data, show_left_ui=False, show_right_ui=False
                 )
+            teleop_key_queue: queue.SimpleQueue[str] | None = None
+            if args.mode == "teleop":
+                teleop_key_queue = queue.SimpleQueue()
+
+                def on_teleop_key(keycode: int) -> None:
+                    token = glfw_key_to_token(keycode)
+                    if token is not None:
+                        teleop_key_queue.put(token)
+
+                viewer = mujoco.viewer.launch_passive(
+                    model,
+                    data,
+                    key_callback=on_teleop_key,
+                    show_left_ui=False,
+                    show_right_ui=False,
+                )
+                teleop_key_poller = X11KeyPoller(TELEOP_JOINT_SPEED.keys())
+                teleop_preview = PreviewBackend.create_auto(args.preview_backend)
+
             for ep in range(args.episodes):
                 if args.mode == "auto":
                     success = run_episode(model, data, renderer, dataset, ctx, cfg, rng, viewer)
                     if viewer is not None and not viewer.is_running():
                         break
                 else:
-                    success = run_teleop_episode(
-                        model, data, renderer, dataset, ctx, cfg, rng, args.preview_backend
+                    if (
+                        viewer is None
+                        or teleop_key_queue is None
+                        or teleop_key_poller is None
+                        or teleop_preview is None
+                    ):
+                        raise RuntimeError("Teleop viewer was not initialized")
+                    success, should_exit = run_teleop_episode(
+                        model,
+                        data,
+                        renderer,
+                        dataset,
+                        ctx,
+                        cfg,
+                        rng,
+                        viewer,
+                        teleop_key_queue,
+                        teleop_key_poller,
+                        teleop_preview,
                     )
+                    if should_exit or not viewer.is_running():
+                        break
                 if success:
                     success_count += 1
                 print(f"[collect_data] episode={ep:04d} success={success} total_success={success_count}")
         finally:
+            if teleop_key_poller is not None:
+                teleop_key_poller.close()
+            if teleop_preview is not None:
+                teleop_preview.close()
             if viewer is not None:
                 viewer.close()
             dataset.finalize()
