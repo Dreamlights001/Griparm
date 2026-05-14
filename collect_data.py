@@ -100,6 +100,7 @@ X11_KEYSYMS = {
 
 
 class PolicyState(Enum):
+    WAITING = auto()
     TRACKING = auto()
     DESCEND = auto()
     GRASP = auto()
@@ -116,6 +117,10 @@ class EpisodeConfig:
     prediction_time: float = 0.5
     pregrasp_height: float = 0.12
     grasp_height: float = 0.06
+    tracking_stable_sec: float = 0.08
+    descend_sec: float = 1.0
+    max_descend_sec: float = 4.0
+    reachable_pos_err: float = 0.035
     grasp_hold_sec: float = 0.45
     release_hold_sec: float = 0.30
     gripper_open: float = 0.0     # URDF qpos0: claws apart
@@ -166,7 +171,7 @@ class SimContext:
 
 @dataclass
 class PolicyContext:
-    state: PolicyState = PolicyState.TRACKING
+    state: PolicyState = PolicyState.WAITING
     lift_place_phase: int = 0
     step_counter_in_state: int = 0
     last_target_quat: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64))
@@ -175,8 +180,10 @@ class PolicyContext:
     grip_target: float = 0.0   # gradually ramped gripper target during GRASP
     _prev_claw_q: float = 0.0  # for detecting when claws stop (contact made)
     grasped: bool = False       # true after verified grip → kinematic hold
+    target_reached_steps: int = 0
     calib_axis_sign: float = 0.0
     calib_side_sign: float = 0.0
+    grasp_tcp_pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     last_ctrl: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=np.float64))
 
 
@@ -444,7 +451,8 @@ def solve_ik_dls(
     pos_tol: float = 5e-4,
     rot_tol: float = 2e-2,
     max_dq_per_step: float = 0.10,
-) -> np.ndarray:
+    return_error: bool = False,
+) -> np.ndarray | tuple[np.ndarray, float, float]:
     target_rot = mat_from_quat_wxyz(target_quat)
     q_orig = data.qpos[arm_qpos_adr].copy()
     q = q_orig.copy()
@@ -453,6 +461,8 @@ def solve_ik_dls(
     jacr = np.zeros((3, model.nv), dtype=np.float64)
     i6 = np.eye(6, dtype=np.float64)
 
+    final_pos_err_norm = float("inf")
+    final_rot_err_norm = float("inf")
     for _ in range(max_iter):
         data.qpos[arm_qpos_adr] = q
         mujoco.mj_forward(model, data)
@@ -461,7 +471,9 @@ def solve_ik_dls(
 
         pos_err = target_pos - curr_pos
         rot_err = orientation_error(curr_rot, target_rot)
-        if np.linalg.norm(pos_err) < pos_tol and np.linalg.norm(rot_err) < rot_tol:
+        final_pos_err_norm = float(np.linalg.norm(pos_err))
+        final_rot_err_norm = float(np.linalg.norm(rot_err))
+        if final_pos_err_norm < pos_tol and final_rot_err_norm < rot_tol:
             break
 
         mujoco.mj_jacSite(model, data, jacp, jacr, site_id)
@@ -473,6 +485,11 @@ def solve_ik_dls(
         dq = np.clip(dq, -0.03, 0.03)
         q = q + dq
 
+    data.qpos[arm_qpos_adr] = q
+    mujoco.mj_forward(model, data)
+    final_pos_err_norm = float(np.linalg.norm(target_pos - data.site_xpos[site_id]))
+    final_rot_err_norm = float(np.linalg.norm(orientation_error(data.site_xmat[site_id].reshape(3, 3), target_rot)))
+
     # Restore original qpos; return a rate-limited target so the arm
     # moves smoothly via actuators instead of jumping kinematically.
     data.qpos[arm_qpos_adr] = q_orig
@@ -481,7 +498,15 @@ def solve_ik_dls(
     # Clip per-joint displacement to max_dq_per_step for smooth motion
     dq_total = q - q_orig
     dq_total = np.clip(dq_total, -max_dq_per_step, max_dq_per_step)
-    return q_orig + dq_total
+    q_target = q_orig + dq_total
+    if return_error:
+        return q_target, final_pos_err_norm, final_rot_err_norm
+    return q_target
+
+
+def solve_ik_dls_target(*args, **kwargs) -> np.ndarray:
+    q_target, _pos_err, _rot_err = solve_ik_dls(*args, return_error=True, **kwargs)
+    return q_target
 
 
 def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
@@ -900,6 +925,37 @@ def expert_policy(
     pregrasp_height_delta = 0.0 if cfg.grasp_calibration is not None else (cfg.pregrasp_height - cfg.grasp_height)
     grasp_height_delta = -cfg.calibration_grasp_drop if cfg.grasp_calibration is not None else 0.0
 
+    if policy.state == PolicyState.WAITING:
+        policy.step_counter_in_state += 1
+        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
+        target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
+        _q_probe, pos_err, _rot_err = solve_ik_dls(
+            model,
+            data,
+            ctx.tcp_site_id,
+            target_pos,
+            target_quat,
+            ctx.arm_qpos_adr,
+            ctx.arm_dof_adr,
+            max_iter=100,
+            damping=0.01,
+            pos_tol=5e-4,
+            return_error=True,
+        )
+        if pos_err <= cfg.reachable_pos_err:
+            policy.state = PolicyState.TRACKING
+            policy.step_counter_in_state = 0
+            policy.target_reached_steps = 0
+            policy.last_target_quat = target_quat
+        else:
+            # Re-evaluate side/axis sign when the target later enters the
+            # reachable window; choosing while far away can lock the wrong side.
+            policy.calib_axis_sign = 0.0
+            policy.calib_side_sign = 0.0
+        ctrl = set_ctrl_from_targets(data, ctx, ctx.home_qpos[ctx.arm_qpos_adr].copy(), cfg.gripper_open)
+        policy.last_ctrl = ctrl
+        return ctrl
+
     if policy.state == PolicyState.TRACKING:
         policy.step_counter_in_state += 1
         target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
@@ -917,16 +973,24 @@ def expert_policy(
             pos_tol=5e-4,
         )
         ctrl = set_ctrl_from_targets(data, ctx, arm_q, cfg.gripper_open)
-        if np.linalg.norm(tcp_pos - target_pos) < 0.015 or policy.step_counter_in_state >= int(1.5 * PHYSICS_HZ):
+        track_err = float(np.linalg.norm(tcp_pos - target_pos))
+        if track_err < 0.012:
+            policy.target_reached_steps += 1
+        else:
+            policy.target_reached_steps = 0
+        if policy.target_reached_steps >= int(cfg.tracking_stable_sec * PHYSICS_HZ):
             policy.state = PolicyState.DESCEND
             policy.step_counter_in_state = 0
+            policy.target_reached_steps = 0
         policy.last_target_quat = target_quat
         policy.last_ctrl = ctrl
         return ctrl
 
     if policy.state == PolicyState.DESCEND:
         policy.step_counter_in_state += 1
-        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, grasp_height_delta)
+        descend_steps = max(1, int(cfg.descend_sec * PHYSICS_HZ))
+        descend_t = min(1.0, policy.step_counter_in_state / descend_steps)
+        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, grasp_height_delta * descend_t)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
         arm_q = solve_ik_dls(
             model,
@@ -941,12 +1005,24 @@ def expert_policy(
             pos_tol=5e-4,
         )
         ctrl = set_ctrl_from_targets(data, ctx, arm_q, cfg.gripper_open)
-        if np.linalg.norm(tcp_pos - target_pos) < 0.010 or policy.step_counter_in_state >= int(1.2 * PHYSICS_HZ):
+        descend_err = float(np.linalg.norm(tcp_pos - target_pos))
+        if descend_t >= 1.0 and descend_err < 0.010:
+            policy.target_reached_steps += 1
+        else:
+            policy.target_reached_steps = 0
+        if policy.target_reached_steps >= int(cfg.tracking_stable_sec * PHYSICS_HZ):
             policy.state = PolicyState.GRASP
             policy.step_counter_in_state = 0
+            policy.target_reached_steps = 0
             # Start closing from current (open) position.
             policy.grip_target = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]] + 0.001
             policy._prev_claw_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
+        elif policy.step_counter_in_state >= int(cfg.max_descend_sec * PHYSICS_HZ) and descend_err > 0.025:
+            # If the arm cannot stay with the moving target, go back to the
+            # calibrated high tracking pose instead of dragging low across the belt.
+            policy.state = PolicyState.TRACKING
+            policy.step_counter_in_state = 0
+            policy.target_reached_steps = 0
         policy.last_target_quat = target_quat
         policy.last_ctrl = ctrl
         return ctrl
@@ -977,21 +1053,25 @@ def expert_policy(
         claw_stalled = abs(claw_q - policy._prev_claw_q) < 1e-7
         policy._prev_claw_q = claw_q
 
-        # Check contact with anomaly.
-        has_contact = False
+        # Check two-sided contact with anomaly.
+        has_left_contact = False
+        has_right_contact = False
         for i in range(data.ncon):
             c = data.contact[i]
             b1 = model.geom_bodyid[c.geom1]
             b2 = model.geom_bodyid[c.geom2]
-            claw_bodies = {ctx.claw_left_body_id, ctx.claw_right_body_id}
-            if (b1 == ctx.anomaly_body_id and b2 in claw_bodies) or \
-               (b2 == ctx.anomaly_body_id and b1 in claw_bodies):
-                has_contact = True
-                break
+            if b1 == ctx.anomaly_body_id and b2 == ctx.claw_left_body_id:
+                has_left_contact = True
+            elif b2 == ctx.anomaly_body_id and b1 == ctx.claw_left_body_id:
+                has_left_contact = True
+            elif b1 == ctx.anomaly_body_id and b2 == ctx.claw_right_body_id:
+                has_right_contact = True
+            elif b2 == ctx.anomaly_body_id and b1 == ctx.claw_right_body_id:
+                has_right_contact = True
 
         hold_steps = int(cfg.grasp_hold_sec * PHYSICS_HZ)
-        # Success: claws stalled on object AND contact confirmed.
-        grasped = claw_stalled and has_contact and policy.grip_target > claw_q + 0.001
+        # Success: claws stalled on object AND both fingers contact the object.
+        grasped = claw_stalled and has_left_contact and has_right_contact and policy.grip_target > claw_q + 0.001
         if grasped:
             policy.grip_target = claw_q   # freeze: don't close further
             policy.grasped = True          # enable kinematic hold during transport
@@ -1000,6 +1080,7 @@ def expert_policy(
             policy.lift_place_phase = 0
             policy.step_counter_in_state = 0
             policy.grasp_xy = anomaly_pos[:2].copy()
+            policy.grasp_tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
         elif policy.step_counter_in_state >= hold_steps:
             # Timeout — grasp failed (claws closed fully on empty space).
             policy.state = PolicyState.DONE
@@ -1023,8 +1104,9 @@ def expert_policy(
 
         if policy.lift_place_phase == 0:
             t = min(1.0, policy.step_counter_in_state / lift_steps)
-            z = 0.03 + t * (0.20 - 0.03)
-            x, y = policy.grasp_xy[0], policy.grasp_xy[1]
+            start = policy.grasp_tcp_pos if np.linalg.norm(policy.grasp_tcp_pos) > 1e-9 else tcp_pos
+            x, y = start[0], start[1]
+            z = start[2] + t * (0.20 - start[2])
         elif policy.lift_place_phase == 1:
             t = min(1.0, policy.step_counter_in_state / move_steps)
             x = policy.grasp_xy[0] + t * (ctx.place_center[0] - policy.grasp_xy[0])
@@ -1476,8 +1558,6 @@ def run_episode(
             cfg=cfg,
             anomaly_conveyor_speed=cfg.conveyor_speed,
         )
-        j1_err = ctrl[0] - data.qpos[ctx.arm_qpos_adr[0]]
-        data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.005, 0.005)
 
         # Hold the grasped object only during transport. Release phase must be
         # a real free-body fall so landing can decide save / retry / discard.
@@ -1790,6 +1870,15 @@ def parse_args() -> argparse.Namespace:
             f"to the closing pose, in meters. Default: {EpisodeConfig.calibration_grasp_drop}."
         ),
     )
+    parser.add_argument(
+        "--prediction-time",
+        type=float,
+        default=EpisodeConfig.prediction_time,
+        help=(
+            "Lead time used to predict the moving anomaly position during tracking, in seconds. "
+            f"Default: {EpisodeConfig.prediction_time}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1842,6 +1931,7 @@ def main() -> None:
             max_data_frames=args.max_data_frames,
             grasp_calibration=load_grasp_calibration(args.grasp_calib),
             calibration_grasp_drop=args.grasp_drop,
+            prediction_time=args.prediction_time,
         )
 
         renderer = mujoco.Renderer(model, width=args.width, height=args.height)
@@ -1870,6 +1960,7 @@ def main() -> None:
         )
         print(
             f"[collect_data] conveyor_speed={cfg.conveyor_speed:.4f}m/s "
+            f"prediction_time={cfg.prediction_time:.3f}s "
             f"max_frames={cfg.max_data_frames} duration={cfg.max_data_frames / DATA_HZ:.1f}s"
         )
         if cfg.grasp_calibration is not None:
