@@ -44,6 +44,7 @@ python collect_data.py --mode auto --episodes 5 --dataset-root Lerobot_datasets/
 | `--max-data-frames` | 2500 | 每个 episode 最多采样帧数，50Hz 下默认 50 秒 |
 | `--mode` | auto | `auto` 或 `teleop` |
 | `--grasp-calib` | `calib_grasp.json` | auto 模式使用的抓取标定文件 |
+| `--grasp-drop` | 0.035 | auto 模式从标定预抓取位向下下降到闭合抓取位的距离，单位 m |
 | `--no-viewer` | false | 隐藏 MuJoCo viewer（auto 模式） |
 | `--overwrite` | false | 强制覆盖已有数据集 |
 | `--resume` | false | 续写已有数据集 |
@@ -102,9 +103,10 @@ TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
 
 标定抓取策略：
 
-- TRACKING 阶段：按实时物体轴线重建标定 TCP 位置，并额外保留安全高度
-- DESCEND 阶段：保持同一个水平相对位置，随传送带上的目标同步横移并下降到标定高度
-- GRASP 阶段：闭合夹爪时继续跟踪同一个相对位置，保证水平方向相对位置不变
+- `calib_grasp.json` 中保存的位置被视为抓取前预对准位姿，该位置本身应高于目标物体
+- TRACKING 阶段：按实时物体轴线重建这个标定相对位姿，并随传送带运动目标同步跟踪
+- DESCEND 阶段：保持标定得到的轴向/侧向相对关系不变，同时随目标同步横移，并从标定高度向下下降 `--grasp-drop`
+- GRASP 阶段：在下降后的抓取高度继续跟踪同一个水平相对位置，同时渐进闭合夹爪
 - 物体轴线正反和左右侧不固定，脚本会在候选相对位姿中选择距离当前 TCP 最近的一组
 
 自动模式释放后的结束逻辑：

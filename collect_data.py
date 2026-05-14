@@ -121,7 +121,10 @@ class EpisodeConfig:
     gripper_open: float = 0.0     # URDF qpos0: claws apart
     gripper_closed: float = 0.038  # near max: claws together
     grasp_calibration: dict | None = None
-    calibration_clearance: float = 0.06
+    # calib_grasp.json stores a pre-grasp TCP pose above the object. Auto mode
+    # first tracks that relative pose, then descends by this amount while
+    # preserving the calibrated axis/side offset and following conveyor motion.
+    calibration_grasp_drop: float = 0.035
 
     @property
     def max_physics_steps(self) -> int:
@@ -678,16 +681,18 @@ def calibrated_tcp_target(
     policy: PolicyContext,
     cfg: EpisodeConfig,
     object_pos: np.ndarray,
-    extra_height: float,
+    height_delta: float,
 ) -> np.ndarray:
     calib = cfg.grasp_calibration
     if calib is None:
-        return object_pos + np.array([0.0, 0.0, cfg.grasp_height + extra_height], dtype=np.float64)
+        return object_pos + np.array([0.0, 0.0, cfg.grasp_height + height_delta], dtype=np.float64)
 
     axis, side, up = object_axis_frame(data, ctx.anomaly_body_id)
     axis_abs = float(calib.get("tcp_axis_offset_abs", abs(float(calib.get("tcp_axis_offset", 0.0)))))
     side_abs = float(calib.get("tcp_side_offset_abs", abs(float(calib.get("tcp_side_offset", 0.0)))))
-    height = float(calib["tcp_height_offset"]) + extra_height
+    # Keep a small positive height above object center so a too-large drop
+    # cannot drive the TCP below the workpiece centerline.
+    height = max(0.015, float(calib["tcp_height_offset"]) + height_delta)
 
     if policy.calib_axis_sign == 0.0 or policy.calib_side_sign == 0.0:
         tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
@@ -892,10 +897,12 @@ def expert_policy(
     anomaly_pos = data.xpos[ctx.anomaly_body_id].copy()
     predicted_pos = anomaly_pos + ctx.conveyor_dir * (anomaly_conveyor_speed * cfg.prediction_time)
     tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+    pregrasp_height_delta = 0.0 if cfg.grasp_calibration is not None else (cfg.pregrasp_height - cfg.grasp_height)
+    grasp_height_delta = -cfg.calibration_grasp_drop if cfg.grasp_calibration is not None else 0.0
 
     if policy.state == PolicyState.TRACKING:
         policy.step_counter_in_state += 1
-        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, cfg.calibration_clearance)
+        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
         arm_q = solve_ik_dls(
             model,
@@ -919,7 +926,7 @@ def expert_policy(
 
     if policy.state == PolicyState.DESCEND:
         policy.step_counter_in_state += 1
-        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, 0.0)
+        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, grasp_height_delta)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
         arm_q = solve_ik_dls(
             model,
@@ -949,7 +956,7 @@ def expert_policy(
         # Gradually close gripper — avoid overshoot that pushes the object away.
         grip_speed = 0.0003  # per step (~0.15/s at 500 Hz)
         policy.grip_target = min(cfg.gripper_closed, policy.grip_target + grip_speed)
-        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, 0.0)
+        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, grasp_height_delta)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
         arm_q = solve_ik_dls(
             model,
@@ -1774,6 +1781,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GRASP_CALIB_JSON,
         help=f"Grasp calibration JSON used by auto mode. Default: {DEFAULT_GRASP_CALIB_JSON}.",
     )
+    parser.add_argument(
+        "--grasp-drop",
+        type=float,
+        default=EpisodeConfig.calibration_grasp_drop,
+        help=(
+            "Auto mode descent distance from the calibrated pre-grasp TCP pose "
+            f"to the closing pose, in meters. Default: {EpisodeConfig.calibration_grasp_drop}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1825,6 +1841,7 @@ def main() -> None:
             conveyor_speed=args.conveyor_speed,
             max_data_frames=args.max_data_frames,
             grasp_calibration=load_grasp_calibration(args.grasp_calib),
+            calibration_grasp_drop=args.grasp_drop,
         )
 
         renderer = mujoco.Renderer(model, width=args.width, height=args.height)
@@ -1855,6 +1872,12 @@ def main() -> None:
             f"[collect_data] conveyor_speed={cfg.conveyor_speed:.4f}m/s "
             f"max_frames={cfg.max_data_frames} duration={cfg.max_data_frames / DATA_HZ:.1f}s"
         )
+        if cfg.grasp_calibration is not None:
+            print(
+                f"[collect_data] grasp_calib={args.grasp_calib} "
+                f"pregrasp_height={cfg.grasp_calibration['tcp_height_offset']:.4f}m "
+                f"grasp_drop={cfg.calibration_grasp_drop:.4f}m"
+            )
 
         dataset = make_dataset(args.dataset_root, fps=DATA_HZ, width=args.width, height=args.height)
         viewer = None
