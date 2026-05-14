@@ -181,6 +181,7 @@ class PolicyContext:
     _prev_claw_q: float = 0.0  # for detecting when claws stop (contact made)
     grasped: bool = False       # true after verified grip → kinematic hold
     target_reached_steps: int = 0
+    last_wait_log_step: int = 0
     calib_axis_sign: float = 0.0
     calib_side_sign: float = 0.0
     grasp_tcp_pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
@@ -507,6 +508,46 @@ def solve_ik_dls(
 def solve_ik_dls_target(*args, **kwargs) -> np.ndarray:
     q_target, _pos_err, _rot_err = solve_ik_dls(*args, return_error=True, **kwargs)
     return q_target
+
+
+def ik_position_residual(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    site_id: int,
+    target_pos: np.ndarray,
+    arm_qpos_adr: np.ndarray,
+    arm_dof_adr: np.ndarray,
+    max_iter: int = 80,
+    damping: float = 0.01,
+) -> float:
+    """Position-only IK probe used for reachable-window gating.
+
+    Full pose IK can reject an otherwise reachable target when the wrist
+    orientation is temporarily hard to satisfy. WAITING only needs to know
+    whether the calibrated pre-grasp position has entered the arm workspace.
+    """
+    q_orig = data.qpos[arm_qpos_adr].copy()
+    q = q_orig.copy()
+    jacp = np.zeros((3, model.nv), dtype=np.float64)
+    i3 = np.eye(3, dtype=np.float64)
+
+    for _ in range(max_iter):
+        data.qpos[arm_qpos_adr] = q
+        mujoco.mj_forward(model, data)
+        pos_err = target_pos - data.site_xpos[site_id]
+        if np.linalg.norm(pos_err) < 5e-4:
+            break
+        mujoco.mj_jacSite(model, data, jacp, None, site_id)
+        j = jacp[:, arm_dof_adr]
+        dq = j.T @ np.linalg.solve(j @ j.T + (damping**2) * i3, pos_err)
+        q = q + np.clip(dq, -0.04, 0.04)
+
+    data.qpos[arm_qpos_adr] = q
+    mujoco.mj_forward(model, data)
+    residual = float(np.linalg.norm(target_pos - data.site_xpos[site_id]))
+    data.qpos[arm_qpos_adr] = q_orig
+    mujoco.mj_forward(model, data)
+    return residual
 
 
 def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
@@ -920,7 +961,10 @@ def expert_policy(
     anomaly_conveyor_speed: float,
 ) -> np.ndarray:
     anomaly_pos = data.xpos[ctx.anomaly_body_id].copy()
-    predicted_pos = anomaly_pos + ctx.conveyor_dir * (anomaly_conveyor_speed * cfg.prediction_time)
+    # Objects are spawned near conveyor_end and move toward conveyor_start:
+    # move_conveyor_objects decreases conveyor coordinate s, i.e. world motion
+    # is along -ctx.conveyor_dir.
+    predicted_pos = anomaly_pos - ctx.conveyor_dir * (anomaly_conveyor_speed * cfg.prediction_time)
     tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
     pregrasp_height_delta = 0.0 if cfg.grasp_calibration is not None else (cfg.pregrasp_height - cfg.grasp_height)
     grasp_height_delta = -cfg.calibration_grasp_drop if cfg.grasp_calibration is not None else 0.0
@@ -929,29 +973,32 @@ def expert_policy(
         policy.step_counter_in_state += 1
         target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
-        _q_probe, pos_err, _rot_err = solve_ik_dls(
+        pos_err = ik_position_residual(
             model,
             data,
             ctx.tcp_site_id,
             target_pos,
-            target_quat,
             ctx.arm_qpos_adr,
             ctx.arm_dof_adr,
             max_iter=100,
             damping=0.01,
-            pos_tol=5e-4,
-            return_error=True,
         )
         if pos_err <= cfg.reachable_pos_err:
             policy.state = PolicyState.TRACKING
             policy.step_counter_in_state = 0
             policy.target_reached_steps = 0
             policy.last_target_quat = target_quat
+            print(f"[auto] target reachable: pos_residual={pos_err:.3f}m -> TRACKING")
         else:
             # Re-evaluate side/axis sign when the target later enters the
             # reachable window; choosing while far away can lock the wrong side.
             policy.calib_axis_sign = 0.0
             policy.calib_side_sign = 0.0
+            if policy.step_counter_in_state - policy.last_wait_log_step >= int(2.0 * PHYSICS_HZ):
+                rel = anomaly_pos - ctx.conveyor_start
+                s = float(np.dot(rel, ctx.conveyor_dir))
+                print(f"[auto] waiting: target not reachable yet, s={s:.3f}m pos_residual={pos_err:.3f}m")
+                policy.last_wait_log_step = policy.step_counter_in_state
         ctrl = set_ctrl_from_targets(data, ctx, ctx.home_qpos[ctx.arm_qpos_adr].copy(), cfg.gripper_open)
         policy.last_ctrl = ctrl
         return ctrl
