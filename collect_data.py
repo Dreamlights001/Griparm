@@ -818,7 +818,19 @@ def load_grasp_calibration(path: Path) -> dict | None:
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
 
+    if (
+        "gripper_body_axis_offset_abs" in raw
+        and "gripper_body_side_offset_abs" in raw
+        and "gripper_body_height_offset" in raw
+    ):
+        raw.setdefault("track_frame", "Hand_Link")
+        return raw
+
     if "tcp_axis_offset_abs" in raw and "tcp_side_offset_abs" in raw and "tcp_height_offset" in raw:
+        print(
+            f"[collect_data] warning: {path} is legacy tcp_site calibration. "
+            "Regenerate with calibrate_grasp.py so auto mode tracks Hand_Link."
+        )
         return raw
 
     if "tcp_to_object" in raw and "object_axis_xy" in raw:
@@ -1037,7 +1049,7 @@ def has_two_claw_anomaly_contact(model: mujoco.MjModel, data: mujoco.MjData, ctx
 
 
 def attach_anomaly_to_tcp(data: mujoco.MjData, ctx: SimContext) -> dict[str, np.ndarray]:
-    gripper_body_pos = data.xpos[ctx.hand_body_id].copy()
+    tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
     tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3).copy()
     obj_pos = data.xpos[ctx.anomaly_body_id].copy()
     obj_rot = data.xmat[ctx.anomaly_body_id].reshape(3, 3).copy()
@@ -1074,7 +1086,7 @@ def expert_policy(
     # move_conveyor_objects decreases conveyor coordinate s, i.e. world motion
     # is along -ctx.conveyor_dir.
     predicted_pos = anomaly_pos - ctx.conveyor_dir * (anomaly_conveyor_speed * cfg.prediction_time)
-    tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+    gripper_body_pos = data.xpos[ctx.hand_body_id].copy()
     pregrasp_height_delta = 0.0 if cfg.grasp_calibration is not None else (cfg.pregrasp_height - cfg.grasp_height)
     grasp_height_delta = -cfg.calibration_grasp_drop if cfg.grasp_calibration is not None else 0.0
 
@@ -1260,7 +1272,7 @@ def expert_policy(
 
         if policy.lift_place_phase == 0:
             t = min(1.0, policy.step_counter_in_state / lift_steps)
-            start = policy.grasp_tcp_pos if np.linalg.norm(policy.grasp_tcp_pos) > 1e-9 else tcp_pos
+            start = policy.grasp_tcp_pos if np.linalg.norm(policy.grasp_tcp_pos) > 1e-9 else gripper_body_pos
             x, y = start[0], start[1]
             z = start[2] + t * (0.20 - start[2])
         elif policy.lift_place_phase == 1:
@@ -1277,8 +1289,8 @@ def expert_policy(
 
         target_pos = np.array([x, y, z], dtype=np.float64)
 
-        arm_q = solve_ik_dls(
-            model, data, ctx.tcp_site_id, target_pos, target_quat,
+        arm_q = solve_ik_dls_body(
+            model, data, ctx.hand_body_id, target_pos, target_quat,
             ctx.arm_qpos_adr, ctx.arm_dof_adr,
             max_iter=50, damping=0.01, pos_tol=5e-4,
         )
@@ -1291,7 +1303,7 @@ def expert_policy(
 
         # Phase transitions
         phase_steps = {0: lift_steps, 1: move_steps, 2: descend_steps, 3: release_steps}
-        dist = np.linalg.norm(data.site_xpos[ctx.tcp_site_id] - target_pos)
+        dist = np.linalg.norm(data.xpos[ctx.hand_body_id] - target_pos)
         if policy.lift_place_phase < 3 and (
             dist < 0.02 or policy.step_counter_in_state >= phase_steps.get(policy.lift_place_phase, 9999)
         ):
@@ -2131,9 +2143,14 @@ def main() -> None:
             f"max_frames={cfg.max_data_frames} duration={cfg.max_data_frames / DATA_HZ:.1f}s"
         )
         if cfg.grasp_calibration is not None:
+            pregrasp_height = cfg.grasp_calibration.get(
+                "gripper_body_height_offset",
+                cfg.grasp_calibration.get("tcp_height_offset", 0.0),
+            )
             print(
                 f"[collect_data] grasp_calib={args.grasp_calib} "
-                f"pregrasp_height={cfg.grasp_calibration['tcp_height_offset']:.4f}m "
+                f"track_frame={cfg.grasp_calibration.get('track_frame', 'legacy_tcp_site')} "
+                f"pregrasp_height={float(pregrasp_height):.4f}m "
                 f"grasp_drop={cfg.calibration_grasp_drop:.4f}m"
             )
 

@@ -422,6 +422,9 @@ def main():
     data = mujoco.MjData(model)
 
     arm_jids, arm_aids, gid, gaid, graid, sid, abid = resolve_ids(model)
+    hand_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Hand_Link")
+    if hand_bid < 0:
+        raise RuntimeError("Hand_Link body not found.")
     claw_left_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_left")
     claw_right_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Claw_Link_right")
     key_token = make_key_token_mapping()
@@ -479,19 +482,19 @@ def main():
                             attached = None
                             print("[reset]")
                         elif k == "i":
-                            tcp_pos = data.site_xpos[sid].copy()
+                            gripper_pos = data.xpos[hand_bid].copy()
                             obj_pos = data.xpos[abid].copy()
                             obj_rot = quat_to_matrix(data.xquat[abid])
                             obj_axis_xy, obj_side_xy, obj_up = object_axis_frame_from_rot(obj_rot)
-                            tcp_rot = data.site_xmat[sid].reshape(3, 3)
-                            grip_x_xy = normalize(np.array([tcp_rot[0, 0], tcp_rot[1, 0], 0.0]))
-                            rel = tcp_pos - obj_pos
+                            gripper_rot = data.xmat[hand_bid].reshape(3, 3)
+                            grip_x_xy = normalize(np.array([gripper_rot[0, 0], gripper_rot[1, 0], 0.0]))
+                            rel = gripper_pos - obj_pos
                             grip_axis_dot = abs(np.dot(grip_x_xy, obj_axis_xy))
                             axis_offset = float(np.dot(rel, obj_axis_xy))
                             side_offset = float(np.dot(rel, obj_side_xy))
                             height_offset = float(np.dot(rel, obj_up))
                             print(
-                                f"[info] TCP={np.round(tcp_pos,3)}  obj={np.round(obj_pos,3)}  "
+                                f"[info] gripper_body={np.round(gripper_pos,3)}  obj={np.round(obj_pos,3)}  "
                                 f"|grip_x·axis|={grip_axis_dot:.4f}  "
                                 f"axis={axis_offset:.4f} side={side_offset:.4f} height={height_offset:.4f}"
                             )
@@ -499,31 +502,31 @@ def main():
                             arm_q = [float(arm_target[i]) for i in range(6)]
                             obj_rot = quat_to_matrix(data.xquat[abid])
                             obj_axis_xy, obj_side_xy, obj_up = object_axis_frame_from_rot(obj_rot)
-                            tcp_pos = data.site_xpos[sid].copy()
+                            gripper_pos = data.xpos[hand_bid].copy()
                             obj_pos = data.xpos[abid].copy()
-                            rel_obj_to_tcp = tcp_pos - obj_pos
-                            axis_offset = float(np.dot(rel_obj_to_tcp, obj_axis_xy))
-                            side_offset = float(np.dot(rel_obj_to_tcp, obj_side_xy))
-                            height_offset = float(np.dot(rel_obj_to_tcp, obj_up))
+                            rel_obj_to_gripper = gripper_pos - obj_pos
+                            axis_offset = float(np.dot(rel_obj_to_gripper, obj_axis_xy))
+                            side_offset = float(np.dot(rel_obj_to_gripper, obj_side_xy))
+                            height_offset = float(np.dot(rel_obj_to_gripper, obj_up))
                             calib = {
-                                "schema_version": 2,
+                                "schema_version": 3,
+                                "track_frame": "Hand_Link",
                                 "arm_joints": arm_q,
                                 "gripper": grip_target,
-                                "tcp_world": tcp_pos.tolist(),
+                                "gripper_body_world": gripper_pos.tolist(),
                                 "object_world": obj_pos.tolist(),
                                 "object_axis_xy": obj_axis_xy.tolist(),
                                 "object_side_xy": obj_side_xy.tolist(),
-                                "tcp_from_object": rel_obj_to_tcp.tolist(),
-                                "tcp_to_object": (obj_pos - tcp_pos).tolist(),  # backward compatibility
-                                "tcp_axis_offset": axis_offset,
-                                "tcp_side_offset": side_offset,
-                                "tcp_axis_offset_abs": abs(axis_offset),
-                                "tcp_side_offset_abs": abs(side_offset),
-                                "tcp_height_offset": height_offset,
+                                "gripper_body_from_object": rel_obj_to_gripper.tolist(),
+                                "gripper_body_axis_offset": axis_offset,
+                                "gripper_body_side_offset": side_offset,
+                                "gripper_body_axis_offset_abs": abs(axis_offset),
+                                "gripper_body_side_offset_abs": abs(side_offset),
+                                "gripper_body_height_offset": height_offset,
                                 "arm_joint_names": ARM_JOINTS,
                                 "notes": (
-                                    "Axis and side offsets are saved as absolute values for auto grasp "
-                                    "so object-axis direction and side choice can be selected online."
+                                    "Auto grasp tracks the gripper body frame Hand_Link relative to the object axis. "
+                                    "Axis and side signs are selected online."
                                 ),
                             }
                             with open(OUTPUT_FILE, "w") as f:
