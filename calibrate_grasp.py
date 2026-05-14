@@ -81,6 +81,20 @@ def normalize(v):
     return v / n if n > 1e-12 else np.zeros_like(v)
 
 
+def object_axis_frame_from_rot(obj_rot):
+    axis = obj_rot[:, 2].copy()
+    axis[2] = 0.0
+    if np.linalg.norm(axis) < 1e-8:
+        axis = obj_rot[:, 0].copy()
+        axis[2] = 0.0
+    axis = normalize(axis)
+    side = normalize(np.cross(np.array([0.0, 0.0, 1.0], dtype=np.float64), axis))
+    if np.linalg.norm(side) < 1e-8:
+        side = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return axis, side, up
+
+
 def object_freejoint_addr(model, body_id):
     if model.body_jntnum[body_id] < 1:
         raise RuntimeError(f"Body {body_id} is expected to have a freejoint.")
@@ -468,22 +482,50 @@ def main():
                             tcp_pos = data.site_xpos[sid].copy()
                             obj_pos = data.xpos[abid].copy()
                             obj_rot = quat_to_matrix(data.xquat[abid])
-                            obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
+                            obj_axis_xy, obj_side_xy, obj_up = object_axis_frame_from_rot(obj_rot)
                             tcp_rot = data.site_xmat[sid].reshape(3, 3)
                             grip_x_xy = normalize(np.array([tcp_rot[0, 0], tcp_rot[1, 0], 0.0]))
-                            perp = abs(np.dot(grip_x_xy, obj_axis_xy))
-                            print(f"[info] TCP={np.round(tcp_pos,3)}  obj={np.round(obj_pos,3)}  perp={perp:.4f}")
+                            rel = tcp_pos - obj_pos
+                            grip_axis_dot = abs(np.dot(grip_x_xy, obj_axis_xy))
+                            axis_offset = float(np.dot(rel, obj_axis_xy))
+                            side_offset = float(np.dot(rel, obj_side_xy))
+                            height_offset = float(np.dot(rel, obj_up))
+                            print(
+                                f"[info] TCP={np.round(tcp_pos,3)}  obj={np.round(obj_pos,3)}  "
+                                f"|grip_x·axis|={grip_axis_dot:.4f}  "
+                                f"axis={axis_offset:.4f} side={side_offset:.4f} height={height_offset:.4f}"
+                            )
                         elif k == "m":
                             arm_q = [float(arm_target[i]) for i in range(6)]
                             obj_rot = quat_to_matrix(data.xquat[abid])
-                            obj_axis_xy = normalize(np.array([obj_rot[0, 2], obj_rot[1, 2], 0.0]))
+                            obj_axis_xy, obj_side_xy, obj_up = object_axis_frame_from_rot(obj_rot)
                             tcp_pos = data.site_xpos[sid].copy()
                             obj_pos = data.xpos[abid].copy()
-                            rel = obj_pos - tcp_pos
-                            calib = {"arm_joints": arm_q, "gripper": grip_target,
-                                     "tcp_world": tcp_pos.tolist(), "object_world": obj_pos.tolist(),
-                                     "object_axis_xy": obj_axis_xy.tolist(), "tcp_to_object": rel.tolist(),
-                                     "arm_joint_names": ARM_JOINTS}
+                            rel_obj_to_tcp = tcp_pos - obj_pos
+                            axis_offset = float(np.dot(rel_obj_to_tcp, obj_axis_xy))
+                            side_offset = float(np.dot(rel_obj_to_tcp, obj_side_xy))
+                            height_offset = float(np.dot(rel_obj_to_tcp, obj_up))
+                            calib = {
+                                "schema_version": 2,
+                                "arm_joints": arm_q,
+                                "gripper": grip_target,
+                                "tcp_world": tcp_pos.tolist(),
+                                "object_world": obj_pos.tolist(),
+                                "object_axis_xy": obj_axis_xy.tolist(),
+                                "object_side_xy": obj_side_xy.tolist(),
+                                "tcp_from_object": rel_obj_to_tcp.tolist(),
+                                "tcp_to_object": (obj_pos - tcp_pos).tolist(),  # backward compatibility
+                                "tcp_axis_offset": axis_offset,
+                                "tcp_side_offset": side_offset,
+                                "tcp_axis_offset_abs": abs(axis_offset),
+                                "tcp_side_offset_abs": abs(side_offset),
+                                "tcp_height_offset": height_offset,
+                                "arm_joint_names": ARM_JOINTS,
+                                "notes": (
+                                    "Axis and side offsets are saved as absolute values for auto grasp "
+                                    "so object-axis direction and side choice can be selected online."
+                                ),
+                            }
                             with open(OUTPUT_FILE, "w") as f:
                                 json.dump(calib, f, indent=2)
                             print(f"\n[SAVED] → {OUTPUT_FILE}")

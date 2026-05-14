@@ -43,6 +43,7 @@ python collect_data.py --mode auto --episodes 5 --dataset-root Lerobot_datasets/
 | `--conveyor-speed` | 0.025 | 传送带速度，单位 m/s |
 | `--max-data-frames` | 2500 | 每个 episode 最多采样帧数，50Hz 下默认 50 秒 |
 | `--mode` | auto | `auto` 或 `teleop` |
+| `--grasp-calib` | `calib_grasp.json` | auto 模式使用的抓取标定文件 |
 | `--no-viewer` | false | 隐藏 MuJoCo viewer（auto 模式） |
 | `--overwrite` | false | 强制覆盖已有数据集 |
 | `--resume` | false | 续写已有数据集 |
@@ -83,7 +84,7 @@ teleop 抓取逻辑：
 
 ## 5. 自动模式采集流程
 
-专家策略由状态机驱动，物理仿真抓取：
+专家策略由状态机驱动，物理仿真抓取。auto 模式会优先读取 `calib_grasp.json` 中保存的“TCP 相对物体轴线”的标定参数；如果文件不存在，则退回到物体中心上方的旧策略。
 
 ```
 TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
@@ -95,9 +96,22 @@ TRACKING → DESCEND → GRASP → LIFT_PLACE → DONE
 | DESCEND | 下降到抓取高度 |
 | GRASP | 渐进闭合夹爪，接触检测，冻结夹持位 |
 | LIFT_PLACE | 4 阶段插值轨迹：提升 → 横移 → 下降 → 释放 |
-| DONE | 保持姿态 |
+| DONE | 松开后等待 anomaly 自由落地，再判定保存、重试或丢弃 |
 
 **夹取策略**：渐进闭合（~0.15/s），检测到爪片停滞 + 接触物体时冻结位置，不再继续闭合。物体靠物理接触力（椭圆摩擦锥 + condim=6 + kp=400）跟随夹爪运动。
+
+标定抓取策略：
+
+- TRACKING 阶段：按实时物体轴线重建标定 TCP 位置，并额外保留安全高度
+- DESCEND 阶段：保持同一个水平相对位置，随传送带上的目标同步横移并下降到标定高度
+- GRASP 阶段：闭合夹爪时继续跟踪同一个相对位置，保证水平方向相对位置不变
+- 物体轴线正反和左右侧不固定，脚本会在候选相对位姿中选择距离当前 TCP 最近的一组
+
+自动模式释放后的结束逻辑：
+
+- anomaly 落入粉色存放区并接近落地稳定时，保存当前 episode
+- anomaly 落回传送带区域时，不结束 episode，重置专家策略并继续尝试二次抓取
+- anomaly 落到非传送带且非存放区的外界区域时，丢弃当前 episode
 
 ## 6. 物理参数
 

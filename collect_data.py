@@ -54,6 +54,7 @@ DEFAULT_MAX_DATA_FRAMES = 2500
 DEFAULT_CONVEYOR_SPEED = 0.025
 WRIST_ROTATE_QUARTER_TURNS_CCW = 0
 VISIBLE_SAMPLE_COUNT = 4
+CONVEYOR_DRIVE_MAX_Z = 0.12
 
 TABLE_Z = 0.02
 CONVEYOR_LENGTH = 1.2
@@ -76,6 +77,7 @@ OBJECT_CENTER_Z_ON_BELT = CONVEYOR_HALF_HEIGHT + 0.018
 RESPAWN_MARGIN = 0.06
 DEFAULT_LAYOUT_XML = Path("env_layout_tuned.xml")
 DEFAULT_CAMERA_XML = Path("env_camera_tuned.xml")
+DEFAULT_GRASP_CALIB_JSON = Path("calib_grasp.json")
 HIDDEN_OBJECT_QPOS = np.array([-2.0, -2.0, -1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 TELEOP_ARM_STEP = 0.015
 TELEOP_GRIPPER_STEP = 0.0015
@@ -118,6 +120,8 @@ class EpisodeConfig:
     release_hold_sec: float = 0.30
     gripper_open: float = 0.0     # URDF qpos0: claws apart
     gripper_closed: float = 0.038  # near max: claws together
+    grasp_calibration: dict | None = None
+    calibration_clearance: float = 0.06
 
     @property
     def max_physics_steps(self) -> int:
@@ -168,6 +172,8 @@ class PolicyContext:
     grip_target: float = 0.0   # gradually ramped gripper target during GRASP
     _prev_claw_q: float = 0.0  # for detecting when claws stop (contact made)
     grasped: bool = False       # true after verified grip → kinematic hold
+    calib_axis_sign: float = 0.0
+    calib_side_sign: float = 0.0
     last_ctrl: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=np.float64))
 
 
@@ -600,18 +606,27 @@ def enforce_camera_binding(model: mujoco.MjModel) -> None:
     model.cam_bodyid[wrist_cam_id] = hand_body_id
 
 
+def object_axis_frame(data: mujoco.MjData, body_id: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    body_rot = data.xmat[body_id].reshape(3, 3)
+    axis = body_rot[:, 2].copy()
+    axis[2] = 0.0
+    if np.linalg.norm(axis) < 1e-8:
+        axis = body_rot[:, 0].copy()
+        axis[2] = 0.0
+    axis = normalize(axis)
+    side = normalize(np.cross(np.array([0.0, 0.0, 1.0], dtype=np.float64), axis))
+    if np.linalg.norm(side) < 1e-8:
+        side = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return axis, side, up
+
+
 def desired_gripper_quat_for_object(data: mujoco.MjData, anomaly_body_id: int) -> np.ndarray:
     # Construct gripper orientation from explicit axes:
-    #   Z = approach direction (forward + down toward conveyor)
+    #   Z = approach direction (vertical down toward conveyor)
     #   X = grip direction (perpendicular to object major axis, horizontal)
     #   Y = orthogonal to X and Z
-    body_rot = data.xmat[anomaly_body_id].reshape(3, 3)
-    obj_axis = body_rot[:, 2].copy()
-    obj_axis[2] = 0.0
-    if np.linalg.norm(obj_axis) < 1e-8:
-        obj_axis = body_rot[:, 0].copy()
-        obj_axis[2] = 0.0
-    obj_axis = normalize(obj_axis)
+    obj_axis, _obj_side, _up = object_axis_frame(data, anomaly_body_id)
 
     # Grip X axis: perpendicular to object axis, horizontal (claws grip from sides).
     grip_x = np.cross(obj_axis, np.array([0.0, 0.0, 1.0], dtype=np.float64))
@@ -619,8 +634,7 @@ def desired_gripper_quat_for_object(data: mujoco.MjData, anomaly_body_id: int) -
         grip_x = np.cross(obj_axis, np.array([0.0, 1.0, 0.0], dtype=np.float64))
     grip_x = normalize(grip_x)
 
-    # Approach Z axis: diagonal forward+down so wrist clears conveyor.
-    approach_z = normalize(np.array([0.5, 0.0, -1.0], dtype=np.float64))
+    approach_z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
 
     # Orthonormal basis: Y = Z × X, then re-orthogonalize X = Y × Z.
     grip_y = normalize(np.cross(approach_z, grip_x))
@@ -628,6 +642,71 @@ def desired_gripper_quat_for_object(data: mujoco.MjData, anomaly_body_id: int) -
 
     rot = np.column_stack([grip_x, grip_y, approach_z])
     return matrix_to_quat(rot)
+
+
+def load_grasp_calibration(path: Path) -> dict | None:
+    if not path.exists():
+        print(f"[collect_data] grasp calibration not found: {path}; using center-based fallback")
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    if "tcp_axis_offset_abs" in raw and "tcp_side_offset_abs" in raw and "tcp_height_offset" in raw:
+        return raw
+
+    if "tcp_to_object" in raw and "object_axis_xy" in raw:
+        axis = normalize(np.asarray(raw["object_axis_xy"], dtype=np.float64))
+        side = normalize(np.cross(np.array([0.0, 0.0, 1.0], dtype=np.float64), axis))
+        rel_obj_to_tcp = -np.asarray(raw["tcp_to_object"], dtype=np.float64)
+        raw["schema_version"] = 2
+        raw["tcp_from_object"] = rel_obj_to_tcp.tolist()
+        raw["object_side_xy"] = side.tolist()
+        raw["tcp_axis_offset"] = float(np.dot(rel_obj_to_tcp, axis))
+        raw["tcp_side_offset"] = float(np.dot(rel_obj_to_tcp, side))
+        raw["tcp_axis_offset_abs"] = abs(float(raw["tcp_axis_offset"]))
+        raw["tcp_side_offset_abs"] = abs(float(raw["tcp_side_offset"]))
+        raw["tcp_height_offset"] = float(rel_obj_to_tcp[2])
+        print(f"[collect_data] upgraded legacy grasp calibration in memory: {path}")
+        return raw
+
+    raise ValueError(f"Unsupported grasp calibration format: {path}")
+
+
+def calibrated_tcp_target(
+    data: mujoco.MjData,
+    ctx: SimContext,
+    policy: PolicyContext,
+    cfg: EpisodeConfig,
+    object_pos: np.ndarray,
+    extra_height: float,
+) -> np.ndarray:
+    calib = cfg.grasp_calibration
+    if calib is None:
+        return object_pos + np.array([0.0, 0.0, cfg.grasp_height + extra_height], dtype=np.float64)
+
+    axis, side, up = object_axis_frame(data, ctx.anomaly_body_id)
+    axis_abs = float(calib.get("tcp_axis_offset_abs", abs(float(calib.get("tcp_axis_offset", 0.0)))))
+    side_abs = float(calib.get("tcp_side_offset_abs", abs(float(calib.get("tcp_side_offset", 0.0)))))
+    height = float(calib["tcp_height_offset"]) + extra_height
+
+    if policy.calib_axis_sign == 0.0 or policy.calib_side_sign == 0.0:
+        tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+        best = None
+        for axis_sign in (-1.0, 1.0):
+            for side_sign in (-1.0, 1.0):
+                candidate = object_pos + axis * (axis_sign * axis_abs) + side * (side_sign * side_abs) + up * height
+                dist = float(np.linalg.norm(candidate - tcp_pos))
+                if best is None or dist < best[0]:
+                    best = (dist, axis_sign, side_sign)
+        policy.calib_axis_sign = best[1]
+        policy.calib_side_sign = best[2]
+
+    return (
+        object_pos
+        + axis * (policy.calib_axis_sign * axis_abs)
+        + side * (policy.calib_side_sign * side_abs)
+        + up * height
+    )
 
 
 def object_quat_laid_down(conveyor_dir: np.ndarray, object_yaw_deg: float) -> np.ndarray:
@@ -816,7 +895,7 @@ def expert_policy(
 
     if policy.state == PolicyState.TRACKING:
         policy.step_counter_in_state += 1
-        target_pos = predicted_pos + np.array([0.0, 0.0, cfg.pregrasp_height], dtype=np.float64)
+        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, cfg.calibration_clearance)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
         arm_q = solve_ik_dls(
             model,
@@ -840,7 +919,7 @@ def expert_policy(
 
     if policy.state == PolicyState.DESCEND:
         policy.step_counter_in_state += 1
-        target_pos = predicted_pos + np.array([0.0, 0.0, cfg.grasp_height], dtype=np.float64)
+        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, 0.0)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
         arm_q = solve_ik_dls(
             model,
@@ -858,7 +937,6 @@ def expert_policy(
         if np.linalg.norm(tcp_pos - target_pos) < 0.010 or policy.step_counter_in_state >= int(1.2 * PHYSICS_HZ):
             policy.state = PolicyState.GRASP
             policy.step_counter_in_state = 0
-            policy.hold_anomaly_on_conveyor = True
             # Start closing from current (open) position.
             policy.grip_target = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]] + 0.001
             policy._prev_claw_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
@@ -871,7 +949,21 @@ def expert_policy(
         # Gradually close gripper — avoid overshoot that pushes the object away.
         grip_speed = 0.0003  # per step (~0.15/s at 500 Hz)
         policy.grip_target = min(cfg.gripper_closed, policy.grip_target + grip_speed)
-        ctrl = set_ctrl_from_targets(data, ctx, data.qpos[ctx.arm_qpos_adr].copy(), policy.grip_target)
+        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, 0.0)
+        target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
+        arm_q = solve_ik_dls(
+            model,
+            data,
+            ctx.tcp_site_id,
+            target_pos,
+            target_quat,
+            ctx.arm_qpos_adr,
+            ctx.arm_dof_adr,
+            max_iter=50,
+            damping=0.01,
+            pos_tol=5e-4,
+        )
+        ctrl = set_ctrl_from_targets(data, ctx, arm_q, policy.grip_target)
 
         # Track claw motion to detect contact stall.
         claw_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
@@ -896,6 +988,7 @@ def expert_policy(
         if grasped:
             policy.grip_target = claw_q   # freeze: don't close further
             policy.grasped = True          # enable kinematic hold during transport
+            policy.hold_anomaly_on_conveyor = True
             policy.state = PolicyState.LIFT_PLACE
             policy.lift_place_phase = 0
             policy.step_counter_in_state = 0
@@ -947,6 +1040,8 @@ def expert_policy(
 
         # Gripper: hold at grip position during lift/move/descend, open during release.
         gripper_target = cfg.gripper_open if policy.lift_place_phase >= 3 else policy.grip_target
+        if policy.lift_place_phase >= 3:
+            policy.grasped = False
         ctrl = set_ctrl_from_targets(data, ctx, arm_q, gripper_target)
 
         # Phase transitions
@@ -1044,6 +1139,9 @@ def move_conveyor_objects(
         rel = pos - ctx.conveyor_start
         s = float(np.dot(rel, ctx.conveyor_dir))
         lat = float(np.dot(rel, ctx.conveyor_lateral))
+        on_conveyor_xy = -RESPAWN_MARGIN <= s <= CONVEYOR_LENGTH + RESPAWN_MARGIN and abs(lat) <= CONVEYOR_HALF_WIDTH
+        if not on_conveyor_xy or pos[2] > CONVEYOR_DRIVE_MAX_Z:
+            continue
 
         s_new = s - conveyor_speed * dt
         target_pos = ctx.conveyor_start + ctx.conveyor_dir * s_new + ctx.conveyor_lateral * lat
@@ -1357,7 +1455,6 @@ def run_episode(
     active_objects = reset_episode(model, data, ctx, rng, cfg)
     policy = PolicyContext()
     sample_count = 0
-    done = False
 
     for step in range(cfg.max_physics_steps):
         move_conveyor_objects(
@@ -1375,9 +1472,9 @@ def run_episode(
         j1_err = ctrl[0] - data.qpos[ctx.arm_qpos_adr[0]]
         data.qpos[ctx.arm_qpos_adr[0]] += np.clip(j1_err, -0.005, 0.005)
 
-        # Hold object at TCP whenever gripper is partially closed.
-        grip_q = data.qpos[model.jnt_qposadr[ctx.gripper_joint_id]]
-        if grip_q > 0.005:
+        # Hold the grasped object only during transport. Release phase must be
+        # a real free-body fall so landing can decide save / retry / discard.
+        if policy.grasped and policy.state == PolicyState.LIFT_PLACE and policy.lift_place_phase < 3:
             tcp = data.site_xpos[ctx.tcp_site_id].copy()
             tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3)
             world_offset = tcp_rot @ np.array([0.0, 0.0, 0.03], dtype=np.float64)
@@ -1396,18 +1493,23 @@ def run_episode(
             capture_dataset_frame(model, data, renderer, dataset, ctx, ctrl)
             sample_count += 1
 
-        if policy.state == PolicyState.DONE:
-            done = True
-            break
+        if policy.state == PolicyState.DONE and anomaly_landed(data, ctx):
+            if anomaly_in_place_region(data, ctx):
+                dataset.save_episode()
+                print("[auto] saved: anomaly landed in place region")
+                return True
+            if anomaly_in_conveyor_region(data, ctx):
+                policy = PolicyContext()
+                print("[auto] retry: anomaly landed back on conveyor")
+                continue
+            dataset.clear_episode_buffer(delete_images=True)
+            print("[auto] discarded: anomaly landed outside conveyor/place regions")
+            return False
         if sample_count >= cfg.max_data_frames:
             break
 
-    success = done and check_success(data, ctx)
-    if success:
-        dataset.save_episode()
-    else:
-        dataset.clear_episode_buffer(delete_images=True)
-    return success
+    dataset.clear_episode_buffer(delete_images=True)
+    return False
 
 
 def handle_teleop_token(
@@ -1666,6 +1768,12 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Camera preview backend used in teleop mode.",
     )
+    parser.add_argument(
+        "--grasp-calib",
+        type=Path,
+        default=DEFAULT_GRASP_CALIB_JSON,
+        help=f"Grasp calibration JSON used by auto mode. Default: {DEFAULT_GRASP_CALIB_JSON}.",
+    )
     return parser.parse_args()
 
 
@@ -1716,6 +1824,7 @@ def main() -> None:
             height=args.height,
             conveyor_speed=args.conveyor_speed,
             max_data_frames=args.max_data_frames,
+            grasp_calibration=load_grasp_calibration(args.grasp_calib),
         )
 
         renderer = mujoco.Renderer(model, width=args.width, height=args.height)

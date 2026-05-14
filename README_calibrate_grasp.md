@@ -30,7 +30,7 @@ conda run -n sim_env python calibrate_grasp.py
 
 | 功能键 | 作用 |
 |--------|------|
-| **m** | 保存当前配置到 `calib_grasp.json` |
+| **m** | 保存当前抓取标定到 `calib_grasp.json` |
 | **g** | 测试抓取 — 闭合夹爪 → 提升 → 检测物体是否被带起 |
 | **r** | 重置场景（随机新物体位置） |
 | **i** | 打印 TCP 与物体的相对位置 |
@@ -52,13 +52,21 @@ conda run -n sim_env python calibrate_grasp.py
 
 ## 5. 输出文件 `calib_grasp.json`
 
+当前版本保存的是 TCP 相对瑕疵件轴线的局部标定，而不是只保存世界坐标差值。自动采集会使用这些字段重建抓取目标：
+
 ```json
 {
+  "schema_version": 2,
   "arm_joints": [0.0, -0.5, 0.3, ...],
   "gripper": 0.0,
   "tcp_world": [0.4, 0.05, 0.08],
   "object_world": [0.4, 0.05, 0.03],
-  "tcp_to_object": [0.0, 0.0, -0.05],
+  "object_axis_xy": [1.0, 0.0, 0.0],
+  "object_side_xy": [0.0, 1.0, 0.0],
+  "tcp_from_object": [0.0, 0.03, 0.05],
+  "tcp_axis_offset_abs": 0.0,
+  "tcp_side_offset_abs": 0.03,
+  "tcp_height_offset": 0.05,
   "arm_joint_names": ["J_jianbu", "J_dabi", ...]
 }
 ```
@@ -68,7 +76,12 @@ conda run -n sim_env python calibrate_grasp.py
 | `arm_joints` | 6 个关节的目标角度 (rad) |
 | `gripper` | 夹爪位置 (0=开, ~0.048=闭) |
 | `tcp_world` | TCP 在世界坐标的位置 |
-| `tcp_to_object` | TCP 到物体的相对向量 |
+| `object_axis_xy` | 瑕疵件轴线在水平面的方向 |
+| `object_side_xy` | 与瑕疵件轴线垂直的水平侧向 |
+| `tcp_from_object` | 标定时从物体中心指向 TCP 的世界坐标向量 |
+| `tcp_axis_offset_abs` | TCP 相对物体轴线方向的绝对偏移；自动执行时不区分轴线正反 |
+| `tcp_side_offset_abs` | TCP 相对物体侧向的绝对偏移；自动执行时自动选择更近的一侧 |
+| `tcp_height_offset` | TCP 高于物体中心的高度偏移 |
 | `arm_joint_names` | 关节名称列表 |
 
 ## 6. 注意事项
