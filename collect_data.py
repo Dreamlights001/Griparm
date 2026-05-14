@@ -146,6 +146,7 @@ class SimContext:
     gripper_right_actuator_id: int
     arm_actuator_ids: list[int]
     tcp_site_id: int
+    hand_body_id: int
     anomaly_body_id: int
     normal_body_ids: list[int]
     claw_left_body_id: int
@@ -510,6 +511,65 @@ def solve_ik_dls_target(*args, **kwargs) -> np.ndarray:
     return q_target
 
 
+def solve_ik_dls_body(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    body_id: int,
+    target_pos: np.ndarray,
+    target_quat: np.ndarray,
+    arm_qpos_adr: np.ndarray,
+    arm_dof_adr: np.ndarray,
+    max_iter: int = 100,
+    damping: float = 0.01,
+    pos_tol: float = 5e-4,
+    rot_tol: float = 2e-2,
+    max_dq_per_step: float = 0.10,
+    return_error: bool = False,
+) -> np.ndarray | tuple[np.ndarray, float, float]:
+    target_rot = mat_from_quat_wxyz(target_quat)
+    q_orig = data.qpos[arm_qpos_adr].copy()
+    q = q_orig.copy()
+
+    jacp = np.zeros((3, model.nv), dtype=np.float64)
+    jacr = np.zeros((3, model.nv), dtype=np.float64)
+    i6 = np.eye(6, dtype=np.float64)
+    final_pos_err_norm = float("inf")
+    final_rot_err_norm = float("inf")
+
+    for _ in range(max_iter):
+        data.qpos[arm_qpos_adr] = q
+        mujoco.mj_forward(model, data)
+        curr_pos = data.xpos[body_id].copy()
+        curr_rot = data.xmat[body_id].reshape(3, 3).copy()
+
+        pos_err = target_pos - curr_pos
+        rot_err = orientation_error(curr_rot, target_rot)
+        final_pos_err_norm = float(np.linalg.norm(pos_err))
+        final_rot_err_norm = float(np.linalg.norm(rot_err))
+        if final_pos_err_norm < pos_tol and final_rot_err_norm < rot_tol:
+            break
+
+        mujoco.mj_jacBody(model, data, jacp, jacr, body_id)
+        j = np.vstack([jacp[:, arm_dof_adr], jacr[:, arm_dof_adr]])
+        err = np.concatenate([pos_err, rot_err])
+        dq = j.T @ np.linalg.solve(j @ j.T + (damping**2) * i6, err)
+        q = q + np.clip(dq, -0.03, 0.03)
+
+    data.qpos[arm_qpos_adr] = q
+    mujoco.mj_forward(model, data)
+    final_pos_err_norm = float(np.linalg.norm(target_pos - data.xpos[body_id]))
+    final_rot_err_norm = float(np.linalg.norm(orientation_error(data.xmat[body_id].reshape(3, 3), target_rot)))
+
+    data.qpos[arm_qpos_adr] = q_orig
+    mujoco.mj_forward(model, data)
+
+    dq_total = np.clip(q - q_orig, -max_dq_per_step, max_dq_per_step)
+    q_target = q_orig + dq_total
+    if return_error:
+        return q_target, final_pos_err_norm, final_rot_err_norm
+    return q_target
+
+
 def ik_position_residual(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -550,6 +610,40 @@ def ik_position_residual(
     return residual
 
 
+def ik_body_position_residual(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    body_id: int,
+    target_pos: np.ndarray,
+    arm_qpos_adr: np.ndarray,
+    arm_dof_adr: np.ndarray,
+    max_iter: int = 80,
+    damping: float = 0.01,
+) -> float:
+    q_orig = data.qpos[arm_qpos_adr].copy()
+    q = q_orig.copy()
+    jacp = np.zeros((3, model.nv), dtype=np.float64)
+    i3 = np.eye(3, dtype=np.float64)
+
+    for _ in range(max_iter):
+        data.qpos[arm_qpos_adr] = q
+        mujoco.mj_forward(model, data)
+        pos_err = target_pos - data.xpos[body_id]
+        if np.linalg.norm(pos_err) < 5e-4:
+            break
+        mujoco.mj_jacBody(model, data, jacp, None, body_id)
+        j = jacp[:, arm_dof_adr]
+        dq = j.T @ np.linalg.solve(j @ j.T + (damping**2) * i3, pos_err)
+        q = q + np.clip(dq, -0.04, 0.04)
+
+    data.qpos[arm_qpos_adr] = q
+    mujoco.mj_forward(model, data)
+    residual = float(np.linalg.norm(target_pos - data.xpos[body_id]))
+    data.qpos[arm_qpos_adr] = q_orig
+    mujoco.mj_forward(model, data)
+    return residual
+
+
 def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
     arm_joint_ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in ARM_JOINTS]
     if any(jid < 0 for jid in arm_joint_ids):
@@ -579,6 +673,9 @@ def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
     tcp_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "tcp_site")
     if tcp_site_id < 0:
         raise RuntimeError("tcp_site missing in env.xml.")
+    hand_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Hand_Link")
+    if hand_body_id < 0:
+        raise RuntimeError("Hand_Link body missing in env.xml.")
 
     anomaly_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "anomaly_0")
     if anomaly_body_id < 0:
@@ -638,6 +735,7 @@ def resolve_context(model: mujoco.MjModel, data: mujoco.MjData) -> SimContext:
         gripper_right_actuator_id=gripper_right_actuator_id,
         arm_actuator_ids=arm_actuator_ids,
         tcp_site_id=tcp_site_id,
+        hand_body_id=hand_body_id,
         anomaly_body_id=anomaly_body_id,
         normal_body_ids=normal_body_ids,
         claw_left_body_id=claw_left_body_id,
@@ -741,7 +839,7 @@ def load_grasp_calibration(path: Path) -> dict | None:
     raise ValueError(f"Unsupported grasp calibration format: {path}")
 
 
-def calibrated_tcp_target(
+def calibrated_gripper_body_target(
     data: mujoco.MjData,
     ctx: SimContext,
     policy: PolicyContext,
@@ -754,19 +852,26 @@ def calibrated_tcp_target(
         return object_pos + np.array([0.0, 0.0, cfg.grasp_height + height_delta], dtype=np.float64)
 
     axis, side, up = object_axis_frame(data, ctx.anomaly_body_id)
-    axis_abs = float(calib.get("tcp_axis_offset_abs", abs(float(calib.get("tcp_axis_offset", 0.0)))))
-    side_abs = float(calib.get("tcp_side_offset_abs", abs(float(calib.get("tcp_side_offset", 0.0)))))
+    axis_abs = float(calib.get(
+        "gripper_body_axis_offset_abs",
+        calib.get("tcp_axis_offset_abs", abs(float(calib.get("tcp_axis_offset", 0.0)))),
+    ))
+    side_abs = float(calib.get(
+        "gripper_body_side_offset_abs",
+        calib.get("tcp_side_offset_abs", abs(float(calib.get("tcp_side_offset", 0.0)))),
+    ))
     # Keep a small positive height above object center so a too-large drop
-    # cannot drive the TCP below the workpiece centerline.
-    height = max(0.015, float(calib["tcp_height_offset"]) + height_delta)
+    # cannot drive the gripper body reference below the workpiece centerline.
+    base_height = float(calib.get("gripper_body_height_offset", calib.get("tcp_height_offset", 0.0)))
+    height = max(0.015, base_height + height_delta)
 
     if policy.calib_axis_sign == 0.0 or policy.calib_side_sign == 0.0:
-        tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+        gripper_body_pos = data.xpos[ctx.hand_body_id].copy()
         best = None
         for axis_sign in (-1.0, 1.0):
             for side_sign in (-1.0, 1.0):
                 candidate = object_pos + axis * (axis_sign * axis_abs) + side * (side_sign * side_abs) + up * height
-                dist = float(np.linalg.norm(candidate - tcp_pos))
+                dist = float(np.linalg.norm(candidate - gripper_body_pos))
                 if best is None or dist < best[0]:
                     best = (dist, axis_sign, side_sign)
         policy.calib_axis_sign = best[1]
@@ -778,6 +883,10 @@ def calibrated_tcp_target(
         + side * (policy.calib_side_sign * side_abs)
         + up * height
     )
+
+
+def calibrated_tcp_target(*args, **kwargs) -> np.ndarray:
+    return calibrated_gripper_body_target(*args, **kwargs)
 
 
 def object_quat_laid_down(conveyor_dir: np.ndarray, object_yaw_deg: float) -> np.ndarray:
@@ -928,7 +1037,7 @@ def has_two_claw_anomaly_contact(model: mujoco.MjModel, data: mujoco.MjData, ctx
 
 
 def attach_anomaly_to_tcp(data: mujoco.MjData, ctx: SimContext) -> dict[str, np.ndarray]:
-    tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+    gripper_body_pos = data.xpos[ctx.hand_body_id].copy()
     tcp_rot = data.site_xmat[ctx.tcp_site_id].reshape(3, 3).copy()
     obj_pos = data.xpos[ctx.anomaly_body_id].copy()
     obj_rot = data.xmat[ctx.anomaly_body_id].reshape(3, 3).copy()
@@ -971,12 +1080,12 @@ def expert_policy(
 
     if policy.state == PolicyState.WAITING:
         policy.step_counter_in_state += 1
-        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
+        target_pos = calibrated_gripper_body_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
-        pos_err = ik_position_residual(
+        pos_err = ik_body_position_residual(
             model,
             data,
-            ctx.tcp_site_id,
+            ctx.hand_body_id,
             target_pos,
             ctx.arm_qpos_adr,
             ctx.arm_dof_adr,
@@ -1005,12 +1114,12 @@ def expert_policy(
 
     if policy.state == PolicyState.TRACKING:
         policy.step_counter_in_state += 1
-        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
+        target_pos = calibrated_gripper_body_target(data, ctx, policy, cfg, predicted_pos, pregrasp_height_delta)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
-        arm_q = solve_ik_dls(
+        arm_q = solve_ik_dls_body(
             model,
             data,
-            ctx.tcp_site_id,
+            ctx.hand_body_id,
             target_pos,
             target_quat,
             ctx.arm_qpos_adr,
@@ -1020,7 +1129,7 @@ def expert_policy(
             pos_tol=5e-4,
         )
         ctrl = set_ctrl_from_targets(data, ctx, arm_q, cfg.gripper_open)
-        track_err = float(np.linalg.norm(tcp_pos - target_pos))
+        track_err = float(np.linalg.norm(gripper_body_pos - target_pos))
         if track_err < 0.012:
             policy.target_reached_steps += 1
         else:
@@ -1037,12 +1146,12 @@ def expert_policy(
         policy.step_counter_in_state += 1
         descend_steps = max(1, int(cfg.descend_sec * PHYSICS_HZ))
         descend_t = min(1.0, policy.step_counter_in_state / descend_steps)
-        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, grasp_height_delta * descend_t)
+        target_pos = calibrated_gripper_body_target(data, ctx, policy, cfg, predicted_pos, grasp_height_delta * descend_t)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
-        arm_q = solve_ik_dls(
+        arm_q = solve_ik_dls_body(
             model,
             data,
-            ctx.tcp_site_id,
+            ctx.hand_body_id,
             target_pos,
             target_quat,
             ctx.arm_qpos_adr,
@@ -1052,7 +1161,7 @@ def expert_policy(
             pos_tol=5e-4,
         )
         ctrl = set_ctrl_from_targets(data, ctx, arm_q, cfg.gripper_open)
-        descend_err = float(np.linalg.norm(tcp_pos - target_pos))
+        descend_err = float(np.linalg.norm(gripper_body_pos - target_pos))
         if descend_t >= 1.0 and descend_err < 0.010:
             policy.target_reached_steps += 1
         else:
@@ -1079,12 +1188,12 @@ def expert_policy(
         # Gradually close gripper — avoid overshoot that pushes the object away.
         grip_speed = 0.0003  # per step (~0.15/s at 500 Hz)
         policy.grip_target = min(cfg.gripper_closed, policy.grip_target + grip_speed)
-        target_pos = calibrated_tcp_target(data, ctx, policy, cfg, predicted_pos, grasp_height_delta)
+        target_pos = calibrated_gripper_body_target(data, ctx, policy, cfg, predicted_pos, grasp_height_delta)
         target_quat = desired_gripper_quat_for_object(data, ctx.anomaly_body_id)
-        arm_q = solve_ik_dls(
+        arm_q = solve_ik_dls_body(
             model,
             data,
-            ctx.tcp_site_id,
+            ctx.hand_body_id,
             target_pos,
             target_quat,
             ctx.arm_qpos_adr,
@@ -1127,7 +1236,7 @@ def expert_policy(
             policy.lift_place_phase = 0
             policy.step_counter_in_state = 0
             policy.grasp_xy = anomaly_pos[:2].copy()
-            policy.grasp_tcp_pos = data.site_xpos[ctx.tcp_site_id].copy()
+            policy.grasp_tcp_pos = data.xpos[ctx.hand_body_id].copy()
         elif policy.step_counter_in_state >= hold_steps:
             # Timeout — grasp failed (claws closed fully on empty space).
             policy.state = PolicyState.DONE
