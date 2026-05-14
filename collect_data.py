@@ -1879,6 +1879,15 @@ def parse_args() -> argparse.Namespace:
             f"Default: {EpisodeConfig.prediction_time}."
         ),
     )
+    parser.add_argument(
+        "--reachable-pos-err",
+        type=float,
+        default=EpisodeConfig.reachable_pos_err,
+        help=(
+            "IK position residual threshold for entering TRACKING from WAITING, in meters. "
+            f"Default: {EpisodeConfig.reachable_pos_err}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1932,6 +1941,7 @@ def main() -> None:
             grasp_calibration=load_grasp_calibration(args.grasp_calib),
             calibration_grasp_drop=args.grasp_drop,
             prediction_time=args.prediction_time,
+            reachable_pos_err=args.reachable_pos_err,
         )
 
         renderer = mujoco.Renderer(model, width=args.width, height=args.height)
@@ -1961,6 +1971,7 @@ def main() -> None:
         print(
             f"[collect_data] conveyor_speed={cfg.conveyor_speed:.4f}m/s "
             f"prediction_time={cfg.prediction_time:.3f}s "
+            f"reachable_pos_err={cfg.reachable_pos_err:.3f}m "
             f"max_frames={cfg.max_data_frames} duration={cfg.max_data_frames / DATA_HZ:.1f}s"
         )
         if cfg.grasp_calibration is not None:
